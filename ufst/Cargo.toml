@@ -1,0 +1,20 @@
+[package]
+name = "union-find"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lib]
+name = "union_find"
+path = "src/lib.rs"
+
+[[bin]]
+name = "union-find"
+path = "src/main.rs"
+
+[[bin]]
+name = "generate_graph"
+path = "src/bin/generate_graph.rs"
