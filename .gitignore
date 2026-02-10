@@ -1,0 +1,39 @@
+# Rust
+target/
+Cargo.lock
+*.rs.bk
+*.pdb
+flycheck*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+uf_benchmark_results.json
+*.log
+
+# Binaries
+ow-uf/bin/exec
