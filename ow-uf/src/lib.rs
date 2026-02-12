@@ -70,7 +70,14 @@ impl LocalUnionFind {
         }
     }
 
+    fn ensure_node(&mut self, i: u32) {
+        self.parent.entry(i).or_insert(i);
+    }
+
     fn find(&mut self, i: u32) -> u32 {
+        // Ensure node exists
+        self.ensure_node(i);
+        
         let mut root = i;
         while let Some(&p) = self.parent.get(&root) {
             if p == root { break; }
@@ -102,6 +109,33 @@ impl LocalUnionFind {
                 self.parent.insert(root_i, root_j);
                 self.rank.insert(root_j, rank_i + 1);
             }
+        }
+    }
+}
+
+// ─── Flat-array Union-Find (cache-friendly, O(α(n)) per op) ───────────────
+
+/// Find root with path halving (flat array)
+fn flat_find(parent: &mut [u32], mut i: u32) -> u32 {
+    while parent[i as usize] != i {
+        parent[i as usize] = parent[parent[i as usize] as usize];
+        i = parent[i as usize];
+    }
+    i
+}
+
+/// Union by rank (flat array)
+fn flat_union(parent: &mut [u32], rank: &mut [u8], a: u32, b: u32) {
+    let ra = flat_find(parent, a);
+    let rb = flat_find(parent, b);
+    if ra != rb {
+        if rank[ra as usize] < rank[rb as usize] {
+            parent[ra as usize] = rb;
+        } else if rank[ra as usize] > rank[rb as usize] {
+            parent[rb as usize] = ra;
+        } else {
+            parent[rb as usize] = ra;
+            rank[ra as usize] += 1;
         }
     }
 }
@@ -219,15 +253,21 @@ async fn load_partition(
     EdgePartition { edges }
 }
 
-/// Optimized 2-Phase Union-Find
-async fn union_find_optimized(
+/// Optimized 2-Phase Union-Find (sync - middleware calls must not be in tokio context)
+fn union_find_optimized(
     params: Input,
     middleware: &MiddlewareActorHandle<ParentMessage>,
 ) -> Output {
     let mut timestamps = vec![timestamp("worker_start")];
     let worker = middleware.info.worker_id;
 
-    // Initialize S3 client (same as before)
+    // Create tokio runtime for async S3 operations only
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // Initialize S3 client
     let credentials_provider = Credentials::from_keys(
         params.input_data.aws_access_key_id.clone(),
         params.input_data.aws_secret_access_key.clone(),
@@ -248,118 +288,112 @@ async fn union_find_optimized(
     };
     let s3_client = S3Client::from_conf(config);
 
-    // Phase 1: Local UF
+    // Phase 1: Local UF — use rt.block_on() ONLY for async S3 loading
     timestamps.push(timestamp("get_input"));
-    let partition = load_partition(&params, &s3_client, worker).await;
+    let partition = rt.block_on(load_partition(&params, &s3_client, worker));
     timestamps.push(timestamp("get_input_end"));
 
+    // Phase 1: Local UF with flat arrays (cache-friendly, no hashing)
     timestamps.push(timestamp("local_uf_start"));
-    let mut uf = LocalUnionFind::new(); // Sparse
-    let mut observed_nodes = HashSet::new();
-    
+    let n = params.num_nodes as usize;
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    let mut rank: Vec<u8> = vec![0; n];
+    let mut seen = vec![false; n];
+
     for &(u, v) in &partition.edges {
-        uf.union(u, v);
-        observed_nodes.insert(u);
-        observed_nodes.insert(v);
+        seen[u as usize] = true;
+        seen[v as usize] = true;
+        flat_union(&mut parent, &mut rank, u, v);
     }
     timestamps.push(timestamp("local_uf_end"));
 
-    // Phase 2: Gather Root Equivalences
-    // Instead of sending the whole parent array, we only send the mapping
-    // for nodes that we actually saw in our edges.
-    let mut root_equivalences = Vec::new();
-    for node in observed_nodes {
-        let root = uf.find(node);
-        // We only care if node != root, otherwise it's redundant information
-        if node != root {
-            root_equivalences.push((node, root));
+    // Phase 2: Collect (node, root) for all seen nodes
+    let mut node_root_pairs: Vec<(u32, u32)> = Vec::new();
+    for i in 0..n {
+        if seen[i] {
+            node_root_pairs.push((i as u32, flat_find(&mut parent, i as u32)));
         }
     }
+
+    println!(
+        "[Worker {}] Sending {} node-root pairs for global merge",
+        worker, node_root_pairs.len()
+    );
 
     timestamps.push(timestamp("reduce_start"));
     // ROOT_WORKER collects all equivalences
     let all_equivalences = middleware
-        .reduce(ParentMessage(root_equivalences), |mut left, right| {
+        .reduce(ParentMessage(node_root_pairs), |mut left, right| {
             left.0.extend(right.0);
             left
         })
         .unwrap();
     timestamps.push(timestamp("reduce_end"));
 
-    // Phase 3: Global Merge (Root only)
+    // Phase 3: Global Merge with flat-array UF (Root worker only)
+    //
+    // For each (node, root) pair received, flat_union(node, root) connects them.
+    // Nodes that appear in multiple workers with different roots get merged
+    // transitively through the shared node. O(N·α(N)) ≈ O(N) total.
+    
     let global_roots = if worker == ROOT_WORKER {
         timestamps.push(timestamp("global_merge_start"));
-        let mut global_uf = LocalUnionFind::new(); // Sparse
-        let mut active_nodes = HashSet::new();
-
-        if let Some(msg) = all_equivalences {
-            for (u, v) in msg.0 {
-                global_uf.union(u, v);
-                active_nodes.insert(u);
-                active_nodes.insert(v);
+        
+        let gn = params.num_nodes as usize;
+        let mut gparent: Vec<u32> = (0..gn as u32).collect();
+        let mut grank: Vec<u8> = vec![0; gn];
+        let mut gseen = vec![false; gn];
+        
+        if let Some(ref msg) = all_equivalences {
+            for &(node, root) in &msg.0 {
+                gseen[node as usize] = true;
+                gseen[root as usize] = true;
+                flat_union(&mut gparent, &mut grank, node, root);
             }
         }
         
-        // Prepare final mapping to broadcast
-        // Optimization: only broadcast roots for nodes that were actually merged
-        let mut mapping = Vec::new();
-        let mut seen_roots = HashSet::new();
-        
-        for &node in &active_nodes {
-            let r = global_uf.find(node);
-            if r != node {
-                mapping.push((node, r));
+        // Count components in a single pass
+        let mut global_roots_set: HashSet<u32> = HashSet::new();
+        let mut num_unseen: usize = 0;
+        for i in 0..gn {
+            if gseen[i] {
+                global_roots_set.insert(flat_find(&mut gparent, i as u32));
+            } else {
+                num_unseen += 1;
             }
-            seen_roots.insert(r);
         }
-
-        let num_comp = (params.num_nodes as usize - active_nodes.len()) + seen_roots.len();
-        println!("[Worker {}] Global merge complete. Components: {}", worker, num_comp);
+        let num_comp = global_roots_set.len() + num_unseen;
+        
+        println!(
+            "[Worker {}] Global merge: {} seen nodes, {} global roots, {} isolated → {} components",
+            worker, gn - num_unseen, global_roots_set.len(), num_unseen, num_comp
+        );
         
         timestamps.push(timestamp("global_merge_end"));
-        Some(ParentMessage(mapping))
+        // Broadcast a minimal message (non-root workers don't use it)
+        Some((ParentMessage(vec![]), num_comp))
     } else {
         None
     };
+    
+    // Extract num_components before broadcast (ROOT_WORKER calculated it)
+    let num_components_computed = global_roots.as_ref().map(|(_, nc)| *nc);
 
     timestamps.push(timestamp("broadcast_start"));
-    let final_mapping = middleware.broadcast(global_roots, ROOT_WORKER).unwrap();
+    let _final_remap = middleware.broadcast(
+        global_roots.map(|(msg, _)| msg), 
+        ROOT_WORKER
+    ).unwrap();
     timestamps.push(timestamp("broadcast_end"));
 
-    // Final result reporting
+    // Final result reporting (simplified - ROOT_WORKER already computed everything)
     let (num_components, results_report) = if worker == ROOT_WORKER {
-        // Calculate num_components without O(N)
-        let mut active_nodes = HashSet::new();
-        let mut final_roots = HashSet::new();
-        let mut component_sizes: HashMap<u32, usize> = HashMap::new();
-
-        for (u, r) in &final_mapping.0 {
-            active_nodes.insert(*u);
-            final_roots.insert(*r);
-            // Note: This size only reflects nodes that were part of cross-partition merges
-            *component_sizes.entry(*r).or_insert(1) += 1;
-        }
+        let num_comp = num_components_computed.unwrap_or(0);
         
-        // Any node in final_roots that isn't in final_mapping keys is also an active node
-        for r in &final_roots {
-            active_nodes.insert(*r);
-        }
-
-        let num_comp = (params.num_nodes as usize - active_nodes.len()) + final_roots.len();
-
         let mut report = String::new();
         report.push_str("\n=== Optimized Union-Find Results ===\n");
         report.push_str(&format!("Total nodes: {}\n", params.num_nodes));
         report.push_str(&format!("Connected components: {}\n", num_comp));
-        report.push_str("(Note: Size distribution below only accounts for nodes involved in global merges)\n");
-        
-        let mut sizes: Vec<usize> = component_sizes.values().cloned().collect();
-        sizes.sort_by(|a, b| b.cmp(a));
-        
-        report.push_str("\nLargest merged components:\n");
-        for (i, size) in sizes.iter().take(10).enumerate() {
-            report.push_str(&format!("  #{}: {} nodes\n", i + 1, size));
-        }
         report.push_str("============================\n");
 
         (Some(num_comp), Some(report))
@@ -381,13 +415,7 @@ async fn union_find_optimized(
 pub fn main(args: Value, burst_middleware: Middleware<ParentMessage>) -> Result<Value, Error> {
     let input: Input = serde_json::from_value(args)?;
     let handle = burst_middleware.get_actor_handle();
-    
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    let result = rt.block_on(union_find_optimized(input, &handle));
+    let result = union_find_optimized(input, &handle);
     serde_json::to_value(result).map_err(|e| e.into())
 }
 

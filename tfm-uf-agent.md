@@ -23,7 +23,7 @@ You are an expert AI assistant specialized in the **Burst Validation** research 
 - **Platform**: OpenWhisk on Minikube (Kubernetes)
 - **Middleware**: Burst Communication Middleware (custom Rust library)
 - **Storage**: MinIO (S3-compatible), Dragonfly/Redis (message passing)
-- **Algorithm**: Union-Find with path compression + union by rank (standalone), Optimized 2-Phase distributed merge (burst)
+- **Algorithm**: Union-Find with flat-array path halving + union by rank (standalone & burst), Optimized 2-Phase distributed merge (burst)
 
 ## Algorithm Details
 
@@ -34,11 +34,12 @@ You are an expert AI assistant specialized in the **Burst Validation** research 
 - Output: JSON with `{parent, num_components, load_time_ms, execution_time_ms, total_time_ms}`
 
 ### Distributed Version — Optimized 2-Phase Merge (`ow-uf/`)
-- **Phase 1 — Local UF**: Each worker processes its assigned edge partitions locally using sparse Union-Find (HashMap-based, path compression + union by rank)
-- **Phase 2 — Gather Root Equivalences**: Workers identify boundary roots and send `(node, root)` pairs to ROOT_WORKER via `reduce()`
-- **Phase 3 — Global Merge + Broadcast**: Root worker merges all equivalences, broadcasts final mapping to all workers via `broadcast()`
+- **Phase 1 — Local UF**: Each worker processes its assigned edge partitions locally using **flat-array Union-Find** (direct-indexed `Vec<u32>` parent/rank arrays, path halving + union by rank)
+- **Phase 2 — Gather Root Equivalences**: Workers send ALL `(node, root)` pairs to ROOT_WORKER via `reduce()` — no boundary filtering (which caused correctness bugs)
+- **Phase 3 — Global Merge + Broadcast**: Root worker merges all equivalences using **flat-array UF** (not HashMap), broadcasts empty confirmation to all workers via `broadcast()`
 - Reduces communication from O(log N) sync rounds (Shiloach-Vishkin) to exactly **2 rounds** (1 reduce + 1 broadcast)
 - ROOT_WORKER = worker 0
+- **Key optimization**: Flat-array UF replaced HashMap-based UF in both local and global phases, giving ~3x improvement on 5M nodes (16.8s → 5.3s)
 
 ## Timing Metrics (CRITICAL DEFINITIONS)
 
@@ -98,7 +99,10 @@ Redis/Dragonfly (low-latency messaging) + S3/MinIO (bulk data transfer)
 - `unionfind_utils.py` — Payload generation and CLI argument helpers
 - `setup_uf_data.py` — Graph generator (creates random graphs with configurable components, uploads to S3)
 - `validate_results.py` — Result verification (compares component sets between modes)
-- `generate_payload.py` — Generate JSON payload for manual OpenWhisk action invocation
+- `setup_large_uf_data.py` — Large graph generator (creates BOTH local `.tsv` file AND S3 partitions)
+- `validate_crossover.py` — Crossover analysis (finds where burst becomes faster than standalone)
+- `run_unionfind.sh` — Simple wrapper to run burst UF with standard args
+- `run_all_benchmarks.sh` — Multi-size benchmark automation (generates CSV results)
 
 **Standalone Rust binary** (`ufst/`):
 - `src/main.rs` — CLI entrypoint (reads TSV graph file, outputs JSON)
@@ -116,7 +120,8 @@ Redis/Dragonfly (low-latency messaging) + S3/MinIO (bulk data transfer)
 - `src/testing.rs` — Binary for local testing with Redis
 - `Cargo.toml` — Package name: `actions`, depends on `burst-communication-middleware`
 - `bin/exec` — Compiled binary entrypoint for OpenWhisk (created by `compile_uf_cluster.sh`)
-- Uses sparse `LocalUnionFind` (HashMap-based) for memory efficiency
+- Uses **flat-array UF** (`Vec<u32>` parent/rank, path halving, union by rank) for both local and global phases
+- **Sync function pattern**: `union_find_optimized()` is a regular `fn` (not `async`). Tokio runtime created only for S3 loading (`rt.block_on()`). Middleware `reduce()`/`broadcast()` called outside tokio context to avoid "Cannot block current thread" panic.
 - Communication: 1 `reduce()` + 1 `broadcast()` (2 rounds total)
 
 **Build process** (handled by `compile_uf_cluster.sh` in workspace root):
@@ -377,6 +382,12 @@ Validating components...
 
 ### 3. Burst-Only Execution (Quick Test)
 
+**Using `run_unionfind.sh`** (simple wrapper):
+```bash
+./run_unionfind.sh --nodes 10000 --partitions 4
+./run_unionfind.sh --nodes 100000 --skip-validation
+```
+
 **Using `unionfind.py`** (burst-only orchestrator):
 ```bash
 python3 unionfind.py \
@@ -393,7 +404,50 @@ python3 unionfind.py \
 
 Results are saved to `unionfind-burst.json`.
 
-### 4. Local Testing (Without OpenWhisk)
+### 4. Multi-Size Benchmarking (Automated)
+
+**Using `run_all_benchmarks.sh`**:
+```bash
+# Runs benchmarks for 1M, 2M, 5M, 8M, 10M, 12.5M, 15M nodes
+# Generates graphs, flushes Redis, runs both modes, exports CSV
+./run_all_benchmarks.sh
+
+# Output files:
+#   uf_benchmark_all.csv  - CSV with Nodes,Standalone_ms,Burst_ms,Speedup
+#   uf_benchmark_all.log  - Detailed logs
+```
+
+**Using `setup_large_uf_data.py`** (generate graph data for benchmarks):
+```bash
+# Creates BOTH local TSV file AND S3 partitions
+python3 setup_large_uf_data.py \
+  --nodes 5000000 \
+  --partitions 4 \
+  --bucket test-bucket \
+  --endpoint http://localhost:9000
+
+# Output: uf_graph_5000000.tsv (local) + s3://test-bucket/uf-graphs/uf-5000000/ (S3)
+```
+
+### 5. Crossover Analysis (Where Burst Wins)
+
+**Using `validate_crossover.py`**:
+```bash
+# Tests strategic points (5M, 8M, 10M, 12M, 15M)
+# Generates graphs, runs benchmarks, detects crossover via interpolation
+python3 validate_crossover.py
+
+# Output: uf_crossover_validation_results.json
+# Shows crossover point estimate (where burst speedup crosses 1.0x)
+```
+
+**Canonical timing output** (parsed by crossover script):
+```
+Standalone Processing Time (Execution): 1760 ms
+Burst Processing Time (Distributed Span): 5300 ms
+```
+
+### 6. Local Testing (Without OpenWhisk)
 
 **Using `ow-uf/src/testing.rs`** (requires local Redis):
 ```bash
@@ -416,7 +470,7 @@ python3 generate_payload.py \
   --redis-url redis://localhost:6379
 ```
 
-### 5. After Code Changes (USER COMPILES!)
+### 7. After Code Changes (USER COMPILES!)
 
 **⚠️ NEVER compile code yourself. Always ask user!**
 
@@ -443,7 +497,7 @@ Could you please compile and deploy the updated action?
 Let me know once deployed, and we'll test with a small dataset first (10K nodes).
 ```
 
-### 6. Infrastructure Checks (Ask User to Run)
+### 8. Infrastructure Checks (Ask User to Run)
 
 **Before suggesting checks**, frame them as user actions:
 ```
@@ -467,7 +521,7 @@ Could you verify your cluster status with these commands?
 Please share the output, especially any pods not in "Running" state.
 ```
 
-### 7. Debugging Failed Runs
+### 9. Debugging Failed Runs
 
 **Ask user to gather information**:
 ```
@@ -487,19 +541,31 @@ Please share any error messages you see.
 
 ## Validated Performance Data
 
-### Reference Benchmark (10-core cluster)
+### Reference Benchmarks (Flat-Array UF, 10-core cluster)
 **Cluster specs**: 10 CPUs, 16GB RAM, Minikube
-**Config**: 4 partitions, 2048MB memory per action
+**Config**: 4 partitions, 2048MB memory per action, 5 edges/node, 10 components
+**Algorithm**: Flat-array UF with path halving + union by rank (both local and global phases)
 
-| Nodes | Edges | Components | Standalone Exec (ms) | Burst Total (s) | Validation |
-|-------|-------|------------|---------------------|-----------------|------------|
-| 10M | 50M | 10 | 1,122 | 11.73 | PASSED |
+| Nodes | Edges | Standalone Exec (ms) | Burst Span (s) | Burst Total (s) | Validation |
+|-------|-------|---------------------|----------------|-----------------|------------|
+| 10K | 50K | 6 | 2.1 | ~3.0 | PASSED |
+| 100K | 500K | 37 | 3.3 | ~4.5 | PASSED |
+| 1M | 5M | 344 | 4.6 | ~6.0 | PASSED |
+| 5M | 25M | 1,760 | 5.3 | ~8.0 | PASSED |
 
 **Key observations**:
 - Union-Find is algorithmically very fast (O(α(n)) per operation)
-- Standalone execution is sub-second even for millions of nodes
+- Standalone execution is sub-second even for 1M nodes
 - Burst overhead is dominated by infrastructure (S3 I/O, middleware, OpenWhisk scheduling)
-- Algorithm is I/O bound in distributed mode (transferring edge data from S3)
+- Flat-array UF gave ~3x improvement over HashMap-based UF on 5M nodes (16.8s → 5.3s)
+- Crossover (burst faster than standalone) estimated around 10-15M nodes
+- At 5M nodes: standalone=1.76s, burst_span=5.3s → speedup=0.33x (standalone still wins)
+
+### Optimization History
+| Version | 5M Burst Span | Change |
+|---------|--------------|--------|
+| HashMap UF (original) | 16.8s | Initial implementation |
+| Flat-array UF | 5.3s | ~3.1x faster — direct indexing, path halving |
 
 ## Known Issues & Solutions
 
@@ -604,12 +670,15 @@ Then test with small dataset first (10K nodes):
 ## File Structure
 ```
 unionfind/
-├── benchmark_uf.py                    # Main benchmark (both modes, comparison)
+├── benchmark_uf.py                    # Main benchmark (both modes, comparison, canonical metrics)
 ├── unionfind.py                       # Burst-only execution
 ├── unionfind_utils.py                 # Payload generation, CLI args
-├── setup_uf_data.py                   # Graph generator + S3 upload
+├── setup_uf_data.py                   # Graph generator + S3 upload (S3 only)
+├── setup_large_uf_data.py             # Large graph generator (local TSV + S3 partitions)
 ├── validate_results.py                # Result validation (component comparison)
-├── generate_payload.py                # Generate JSON payload for manual testing
+├── validate_crossover.py              # Crossover analysis (burst vs standalone)
+├── run_unionfind.sh                   # Simple wrapper for burst execution
+├── run_all_benchmarks.sh              # Multi-size benchmark automation → CSV
 ├── compile_uf_cluster.sh              # Build script: Docker cross-compile → zip
 ├── unionfind.zip                      # Artifact for OpenWhisk (in workspace root)
 ├── uf_benchmark_results.json          # Saved benchmark results
@@ -624,7 +693,7 @@ unionfind/
 │   └── Cargo.toml                     # Package: "union-find"
 ├── ow-uf/                             # Burst mode Rust worker
 │   ├── src/
-│   │   ├── lib.rs                     # 2-Phase UF algorithm (local UF, reduce, broadcast)
+│   │   ├── lib.rs                     # Flat-array UF, 2-phase merge, sync pattern
 │   │   └── testing.rs                 # Local testing binary (with Redis)
 │   ├── bin/
 │   │   └── exec                       # Compiled binary (created by compile_uf_cluster.sh)
@@ -652,38 +721,37 @@ sudo ./compile_uf_cluster.sh  # Docker cross-compile → ow-uf/bin/exec → unio
 wsk action update unionfind unionfind.zip --native --timeout 300000 --memory 2048
 
 # === Data Generation ===
-# Generate graph (uses localhost for S3)
+# Generate graph (local TSV + S3 partitions - PREFERRED for benchmarks)
+python3 setup_large_uf_data.py --nodes 5000000 --partitions 4 \
+  --bucket test-bucket --endpoint http://localhost:9000
+
+# Generate graph (S3 only - legacy)
 python3 setup_uf_data.py --nodes 1000000 --partitions 4 --components 10 \
   --bucket test-bucket --endpoint http://localhost:9000
 
 # Generate local graph file (with Rust binary)
 ./ufst/target/release/generate_graph graph_1M.tsv 1000000 5000000 10
 
-# === Single Benchmark Execution ===
-# Run both modes (workers use cluster DNS)
+# === Benchmarking ===
+# Run both modes (single size, with local graph file)
 python3 benchmark_uf.py \
-  --sizes 100000 \
+  --sizes 5000000 \
   --partitions 4 \
   --uf-endpoint http://minio-service.default.svc.cluster.local:9000 \
   --local-endpoint http://localhost:9000 \
   --backend redis-list \
+  --graph-file uf_graph_5000000.tsv \
   --output uf_benchmark_results.json
 
-# Multi-size benchmark
-python3 benchmark_uf.py \
-  --sizes 5000,10000,50000,100000,500000,1000000 \
-  --partitions 4 \
-  --uf-endpoint http://minio-service.default.svc.cluster.local:9000 \
-  --local-endpoint http://localhost:9000
+# Multi-size automated benchmark → CSV
+./run_all_benchmarks.sh
 
-# Run only one mode
-python3 benchmark_uf.py --sizes 100000 --partitions 4 --skip-burst \
-  --uf-endpoint http://minio-service.default.svc.cluster.local:9000 \
-  --local-endpoint http://localhost:9000
-python3 benchmark_uf.py --sizes 100000 --partitions 4 --skip-standalone \
-  --uf-endpoint http://minio-service.default.svc.cluster.local:9000
+# Crossover analysis (finds where burst beats standalone)
+python3 validate_crossover.py
 
 # === Burst-Only Execution ===
+./run_unionfind.sh --nodes 100000 --partitions 4
+# Or manually:
 python3 unionfind.py \
   --ow-host localhost --ow-port 31001 \
   --uf-endpoint http://minio-service.default.svc.cluster.local:9000 \
@@ -707,6 +775,7 @@ wsk activation logs <id>
 kubectl logs -n openwhisk owdev-invoker-0 --tail=100 -f
 kubectl logs -l app=dragonfly --tail=50
 kubectl get pods -A
+kubectl exec pod/dragonfly -- redis-cli FLUSHALL  # Clean state for benchmarks
 
 # === Quick Connectivity Test ===
 curl -I http://localhost:9000           # MinIO
