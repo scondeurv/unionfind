@@ -56,63 +56,6 @@ impl From<ParentMessage> for Bytes {
     }
 }
 
-/// Local Union-Find structure with path compression and union by rank (Sparse)
-struct LocalUnionFind {
-    parent: HashMap<u32, u32>,
-    rank: HashMap<u32, u32>,
-}
-
-impl LocalUnionFind {
-    fn new() -> Self {
-        LocalUnionFind {
-            parent: HashMap::new(),
-            rank: HashMap::new(),
-        }
-    }
-
-    fn ensure_node(&mut self, i: u32) {
-        self.parent.entry(i).or_insert(i);
-    }
-
-    fn find(&mut self, i: u32) -> u32 {
-        // Ensure node exists
-        self.ensure_node(i);
-        
-        let mut root = i;
-        while let Some(&p) = self.parent.get(&root) {
-            if p == root { break; }
-            root = p;
-        }
-
-        // Path compression
-        let mut curr = i;
-        while let Some(&p) = self.parent.get(&curr) {
-            if p == root { break; }
-            self.parent.insert(curr, root);
-            curr = p;
-        }
-        root
-    }
-
-    fn union(&mut self, i: u32, j: u32) {
-        let root_i = self.find(i);
-        let root_j = self.find(j);
-        if root_i != root_j {
-            let rank_i = *self.rank.get(&root_i).unwrap_or(&0);
-            let rank_j = *self.rank.get(&root_j).unwrap_or(&0);
-
-            if rank_i < rank_j {
-                self.parent.insert(root_i, root_j);
-            } else if rank_i > rank_j {
-                self.parent.insert(root_j, root_i);
-            } else {
-                self.parent.insert(root_i, root_j);
-                self.rank.insert(root_j, rank_i + 1);
-            }
-        }
-    }
-}
-
 // ─── Flat-array Union-Find (cache-friendly, O(α(n)) per op) ───────────────
 
 /// Find root with path halving (flat array)
@@ -125,6 +68,7 @@ fn flat_find(parent: &mut [u32], mut i: u32) -> u32 {
 }
 
 /// Union by rank (flat array)
+/// NOTE: `u8` rank is sufficient — rank is bounded by O(log n), so u8 supports up to 2^255 nodes.
 fn flat_union(parent: &mut [u32], rank: &mut [u8], a: u32, b: u32) {
     let ra = flat_find(parent, a);
     let rb = flat_find(parent, b);
@@ -307,11 +251,17 @@ fn union_find_optimized(
     }
     timestamps.push(timestamp("local_uf_end"));
 
-    // Phase 2: Collect (node, root) for all seen nodes
+    // Phase 2: Collect (node, root) only for non-root seen nodes.
+    // Self-pairs (root, root) are omitted — the global UF already initialises
+    // parent[i] = i, so they carry no new information. This reduces the
+    // volume of data transferred during the reduce step.
     let mut node_root_pairs: Vec<(u32, u32)> = Vec::new();
     for i in 0..n {
         if seen[i] {
-            node_root_pairs.push((i as u32, flat_find(&mut parent, i as u32)));
+            let root = flat_find(&mut parent, i as u32);
+            if root != i as u32 {
+                node_root_pairs.push((i as u32, root));
+            }
         }
     }
 

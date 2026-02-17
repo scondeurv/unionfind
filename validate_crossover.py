@@ -40,8 +40,9 @@ def generate_graph(nodes):
     """Generate graph data (local file + S3)."""
     log(f"Generating {nodes/1e6:.1f}M node graph...")
 
+    python_executable = "/home/sergio/src/unionfind/.venv/bin/python"
     result = subprocess.run([
-        sys.executable, "setup_large_uf_data.py",
+        python_executable, "setup_large_uf_data.py",
         "--nodes", str(nodes),
         "--partitions", str(PARTITIONS),
         "--bucket", BUCKET,
@@ -78,9 +79,11 @@ def run_benchmark(nodes):
 
     # Run benchmark
     log(f"Running benchmark (Standalone + Burst)...")
+    python_executable = "/home/sergio/src/unionfind/.venv/bin/python"
 
-    result = subprocess.run([
-        sys.executable, "benchmark_uf.py",
+    # We use a piped process to stream output in real-time
+    process = subprocess.Popen([
+        python_executable, "benchmark_uf.py",
         "--ow-host", "localhost",
         "--ow-port", "31001",
         "--uf-endpoint", S3_ENDPOINT,
@@ -90,23 +93,32 @@ def run_benchmark(nodes):
         "--sizes", str(nodes),
         "--runtime-memory", str(MEMORY),
         "--backend", "redis-list",
-        "--chunk-size", "1024",
+        "--chunk-size", "262144",
         "--graph-file", graph_file,
         "--output", f"uf_crossover_{nodes}.json",
-    ], capture_output=True, text=True, timeout=1200)
+    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
-    if result.returncode != 0:
-        log(f"❌ Benchmark failed: {result.stderr}")
+    output = []
+    while True:
+        line = process.stdout.readline()
+        if not line and process.poll() is not None:
+            break
+        if line:
+            print(line, end='', flush=True)
+            output.append(line)
+
+    process.wait()
+    full_output = "".join(output)
+
+    if process.returncode != 0:
+        log(f"❌ Benchmark failed for {nodes/1e6:.1f}M nodes")
         return None
-
-    output = result.stdout
-    print(output)
 
     # Parse canonical timing lines
     standalone_time = None
     burst_time = None
 
-    for line in output.split('\n'):
+    for line in full_output.split('\n'):
         if 'Standalone Processing Time (Execution):' in line:
             try:
                 standalone_time = float(line.split(':')[1].strip().split()[0])
