@@ -32,7 +32,8 @@ class OpenwhiskExecutor:
 
     def burst(self, action_name, params_list, file, is_zip=False, memory=256, debug_mode=False, custom_image=None,
               backend="rabbitmq",
-              burst_size=None, chunk_size=None, join=False, timeout=900000) -> ResultDataset:
+              burst_size=None, chunk_size=None, join=False, timeout=900000,
+              completion_timeout=None) -> ResultDataset:
         """
         Function to invoke a burst of actions
         :param action_name: the name of the action to invoke. Action must be located into functions folder.
@@ -47,6 +48,7 @@ class OpenwhiskExecutor:
         :param chunk_size: in burst comm middleware message exchanges (in KB)
         :param join: if True, the burst is executed in heterogeneous containers that respects the multiplicity of the burst size
         :param timeout: timeout in milliseconds for the action execution (default: 60000)
+        :param completion_timeout: max seconds to wait for all activations to complete. If None, wait indefinitely.
         :return: Dataset with the results and some metrics of the executions
         """
         dataset = ResultDataset()
@@ -56,7 +58,7 @@ class OpenwhiskExecutor:
         for index, activation_id in enumerate(activation_ids):
             dataset.add_invocation(index, activation_id, time.time(), is_burst=True)
         fetch_count = 0
-        self.__wait_for_completion(dataset)
+        self.__wait_for_completion(dataset, completion_timeout=completion_timeout)
         return dataset
 
     def map(self, action_name, params_list, file, is_zip=False, memory=256, custom_image=None, timeout=60000) -> ResultDataset:
@@ -151,9 +153,20 @@ class OpenwhiskExecutor:
             logger.debug(f"Function {activation_id} not finished: {response.text}")
             return None
 
-    def __wait_for_completion(self, dataset):
+    def __wait_for_completion(self, dataset, completion_timeout=None):
         monitor_count = 0
+        start_time = time.time()
         while any("result" not in item for item in dataset.results):
+            # Check if completion timeout exceeded
+            if completion_timeout is not None:
+                elapsed = time.time() - start_time
+                if elapsed > completion_timeout:
+                    missing = [item for item in dataset.results if "result" not in item]
+                    for item in missing:
+                        logger.warning(f"Activation {item['activationId']} timed out after {elapsed:.0f}s")
+                        dataset.add_result(item["activationId"], 0, 0,
+                                           {"error": f"completion_timeout after {elapsed:.0f}s"})
+                    break
             missing_results = [item for item in dataset.results if "result" not in item]
             for item in missing_results:
                 result = self.__check_function_finished(item["activationId"])

@@ -118,7 +118,8 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float]:
                         backend=args.backend,
                         chunk_size=args.chunk_size,
                         is_zip=True,
-                        timeout=900000)
+                        timeout=900000,
+                        completion_timeout=120)
     finished = get_millis()
     
     dt_results = dt.get_results()

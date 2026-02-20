@@ -16,7 +16,7 @@
 //! This reduces communication from O(log N) sync rounds to exactly 2 rounds.
 
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use aws_config::Region;
 use aws_credential_types::Credentials;
@@ -286,7 +286,7 @@ fn union_find_optimized(
     // Nodes that appear in multiple workers with different roots get merged
     // transitively through the shared node. O(N·α(N)) ≈ O(N) total.
     
-    let global_roots = if worker == ROOT_WORKER {
+    let num_comp = if worker == ROOT_WORKER {
         timestamps.push(timestamp("global_merge_start"));
         
         let gn = params.num_nodes as usize;
@@ -312,34 +312,24 @@ fn union_find_optimized(
                 num_unseen += 1;
             }
         }
-        let num_comp = global_roots_set.len() + num_unseen;
+        let nc = global_roots_set.len() + num_unseen;
         
         println!(
             "[Worker {}] Global merge: {} seen nodes, {} global roots, {} isolated → {} components",
-            worker, gn - num_unseen, global_roots_set.len(), num_unseen, num_comp
+            worker, gn - num_unseen, global_roots_set.len(), num_unseen, nc
         );
         
         timestamps.push(timestamp("global_merge_end"));
-        // Broadcast a minimal message (non-root workers don't use it)
-        Some((ParentMessage(vec![]), num_comp))
+        nc
     } else {
-        None
+        0
     };
-    
-    // Extract num_components before broadcast (ROOT_WORKER calculated it)
-    let num_components_computed = global_roots.as_ref().map(|(_, nc)| *nc);
 
-    timestamps.push(timestamp("broadcast_start"));
-    let _final_remap = middleware.broadcast(
-        global_roots.map(|(msg, _)| msg), 
-        ROOT_WORKER
-    ).unwrap();
-    timestamps.push(timestamp("broadcast_end"));
-
-    // Final result reporting (simplified - ROOT_WORKER already computed everything)
+    // Final result reporting — ROOT_WORKER already computed everything during
+    // the global merge.  The broadcast step has been removed because it was
+    // sending an empty message (ParentMessage(vec![])) and the non-root
+    // workers were blocking on it indefinitely, causing 60-min timeouts.
     let (num_components, results_report) = if worker == ROOT_WORKER {
-        let num_comp = num_components_computed.unwrap_or(0);
-        
         let mut report = String::new();
         report.push_str("\n=== Optimized Union-Find Results ===\n");
         report.push_str(&format!("Total nodes: {}\n", params.num_nodes));

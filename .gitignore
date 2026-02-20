@@ -37,3 +37,15 @@ uf_benchmark_results.json
 
 # Binaries
 ow-uf/bin/exec
+unionfind.zip
+uf_graph_15000000.tsv
+uf_graph_12000000.tsv
+uf_graph_10000000.tsv
+uf_graph_8000000.tsv
+uf_graph_5000000.tsv
+uf_crossover_validation_results.json
+uf_crossover_15000000.json
+uf_crossover_12000000.json
+uf_crossover_10000000.json
+uf_crossover_8000000.json
+uf_crossover_5000000.json
