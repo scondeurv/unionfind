@@ -22,7 +22,9 @@ ahash = "0.8"
 aws-sdk-s3 = { version = "1.84.0", features = ["behavior-version-latest"] }
 aws-config = { version = "1.6.2", features = ["behavior-version-latest"] }
 aws-credential-types = { version = "1.2.3", features = ["hardcoded-credentials"] }
-clap = { version = "4.5.4", features = ["derive"] }
+clap = { version = "=4.5.4", features = ["derive"] }
+# Evita resolver clap_lex 1.1.x, que requiere edition2024 no soportada por el Cargo del runtime.
+clap_lex = "=1.0.0"
 
 [dev-dependencies]
 proptest = "1.4"

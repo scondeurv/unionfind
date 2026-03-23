@@ -8,6 +8,8 @@ around 10-15M nodes. We test points around that range.
 """
 import subprocess
 import json
+import os
+import statistics
 import sys
 import time
 from datetime import datetime
@@ -20,14 +22,17 @@ TEST_POINTS = [
     12000000,   # 12M - Near crossover
     15000000,   # 15M - Burst should win
 ]
+RUNS = 5
 
 PARTITIONS = 4
 MEMORY = 2048
-S3_ENDPOINT = "http://minio-service.default.svc.cluster.local:9000"
-LOCAL_ENDPOINT = "http://localhost:9000"
-BUCKET = "test-bucket"
+S3_ENDPOINT = os.environ.get("S3_WORKER_ENDPOINT", "http://minio-service.default.svc.cluster.local:9000")
+LOCAL_ENDPOINT = os.environ.get("S3_HOST_ENDPOINT", "http://localhost:9000")
+BUCKET = os.environ.get("S3_BUCKET", "test-bucket")
 EDGES_PER_NODE = 5
 COMPONENTS = 10
+PYTHON_CMD = os.environ.get("VALIDATION_PYTHON", sys.executable)
+FLUSH_CMD = os.environ.get("UF_FLUSH_CMD", "kubectl exec pod/dragonfly -- redis-cli FLUSHALL")
 
 
 def log(message):
@@ -40,9 +45,8 @@ def generate_graph(nodes):
     """Generate graph data (local file + S3)."""
     log(f"Generating {nodes/1e6:.1f}M node graph...")
 
-    python_executable = "/home/sergio/src/unionfind/.venv/bin/python"
     result = subprocess.run([
-        python_executable, "setup_large_uf_data.py",
+        PYTHON_CMD, "setup_large_uf_data.py",
         "--nodes", str(nodes),
         "--partitions", str(PARTITIONS),
         "--bucket", BUCKET,
@@ -59,31 +63,27 @@ def generate_graph(nodes):
     return True
 
 
-def run_benchmark(nodes):
+def run_benchmark(nodes, skip_generate=False):
     """Run benchmark for given size and return parsed results."""
     log(f"\n{'='*80}")
     log(f"BENCHMARKING: {nodes/1e6:.1f}M nodes")
     log(f"{'='*80}")
 
     # Generate graph
-    if not generate_graph(nodes):
+    if not skip_generate and not generate_graph(nodes):
         return None
 
     graph_file = f"uf_graph_{nodes}.tsv"
 
     # Flush Redis/Dragonfly for clean state
-    subprocess.run(
-        ["kubectl", "exec", "pod/dragonfly", "--", "redis-cli", "FLUSHALL"],
-        capture_output=True, timeout=30
-    )
+    if FLUSH_CMD:
+        subprocess.run(FLUSH_CMD.split(), capture_output=True, timeout=30)
 
     # Run benchmark
     log(f"Running benchmark (Standalone + Burst)...")
-    python_executable = "/home/sergio/src/unionfind/.venv/bin/python"
-
     # We use a piped process to stream output in real-time
     process = subprocess.Popen([
-        python_executable, "benchmark_uf.py",
+        PYTHON_CMD, "benchmark_uf.py",
         "--ow-host", "localhost",
         "--ow-port", "31001",
         "--uf-endpoint", S3_ENDPOINT,
@@ -159,35 +159,79 @@ def main():
     log("=" * 80)
     log(f"Testing {len(TEST_POINTS)} strategic points")
     log(f"Test points: {[f'{n/1e6:.1f}M' for n in TEST_POINTS]}")
+    log(f"Runs per point: {RUNS}")
     log(f"Config: partitions={PARTITIONS}, memory={MEMORY}MB, "
         f"edges/node={EDGES_PER_NODE}, components={COMPONENTS}")
+    log(f"Python runner: {PYTHON_CMD}")
     log("=" * 80)
 
     results = []
 
     for nodes in TEST_POINTS:
-        result = run_benchmark(nodes)
-        if result:
-            results.append(result)
-        else:
-            log(f"⚠️  Skipping {nodes/1e6:.1f}M due to errors")
+        sa_times = []
+        bs_times = []
 
-        # Brief pause between benchmarks
+        for run_idx in range(RUNS):
+            log(f"\n▶ Run {run_idx + 1}/{RUNS} — {nodes/1e6:.1f}M nodes")
+            result = run_benchmark(nodes, skip_generate=run_idx > 0)
+            if result:
+                sa_times.append(result["standalone_ms"])
+                bs_times.append(result["burst_ms"])
+            else:
+                log(f"⚠️  Run {run_idx + 1} failed, skipping")
+            if run_idx < RUNS - 1:
+                time.sleep(3)
+
+        if not sa_times:
+            log(f"⚠️  All runs failed for {nodes/1e6:.1f}M, skipping point")
+            continue
+
+        sa_mean = statistics.mean(sa_times)
+        bs_mean = statistics.mean(bs_times)
+        sa_std = statistics.stdev(sa_times) if len(sa_times) > 1 else 0.0
+        bs_std = statistics.stdev(bs_times) if len(bs_times) > 1 else 0.0
+        speedup = sa_mean / bs_mean if bs_mean > 0 else 0.0
+        winner = "Burst" if speedup > 1.0 else "Standalone"
+
+        log(f"\n📊 Aggregate {nodes/1e6:.1f}M ({len(sa_times)} runs):")
+        log(f"   Standalone: {sa_mean:.1f} ± {sa_std:.1f} ms  (runs: {[f'{v:.0f}' for v in sa_times]})")
+        log(f"   Burst span: {bs_mean:.1f} ± {bs_std:.1f} ms  (runs: {[f'{v:.0f}' for v in bs_times]})")
+        log(f"   Speedup:    {speedup:.2f}x  →  {winner}")
+
+        results.append({
+            "nodes": nodes,
+            "standalone_ms": round(sa_mean, 2),
+            "standalone_std_ms": round(sa_std, 2),
+            "standalone_runs_ms": sa_times,
+            "burst_ms": round(bs_mean, 2),
+            "burst_std_ms": round(bs_std, 2),
+            "burst_runs_ms": bs_times,
+            "speedup": round(speedup, 4),
+            "winner": winner,
+        })
+
         time.sleep(5)
 
     # Summary
     log("\n" + "=" * 80)
-    log("CROSSOVER VALIDATION SUMMARY (PROCESSING TIME)")
+    log("CROSSOVER VALIDATION SUMMARY (MEAN OVER RUNS)")
     log("=" * 80)
-    log(f"{'Nodes':>12} {'Standalone':>12} {'Burst Span':>12} {'Speedup':>10} {'Winner':>12}")
+    log(f"{'Nodes':>12} {'SA mean':>12} {'SA std':>9} {'BS mean':>12} {'BS std':>9} {'Speedup':>10} {'Winner':>12}")
     log("-" * 80)
 
     crossover_found = False
     crossover_point = None
 
     for i, r in enumerate(results):
-        log(f"{r['nodes']/1e6:>10.1f}M {r['standalone_ms']:>10.0f}ms "
-            f"{r['burst_ms']:>10.0f}ms {r['speedup']:>9.2f}x {r['winner']:>12}")
+        log(
+            f"{r['nodes']/1e6:>10.1f}M "
+            f"{r['standalone_ms']:>10.1f}ms "
+            f"{r['standalone_std_ms']:>7.1f}ms "
+            f"{r['burst_ms']:>10.1f}ms "
+            f"{r['burst_std_ms']:>7.1f}ms "
+            f"{r['speedup']:>9.2f}x "
+            f"{r['winner']:>12}"
+        )
 
         # Detect crossover via linear interpolation
         if i > 0 and not crossover_found:
@@ -218,6 +262,7 @@ def main():
     output_data = {
         'timestamp': datetime.now().isoformat(),
         'test_points': TEST_POINTS,
+        'runs_per_point': RUNS,
         'results': results,
         'crossover_estimate': crossover_point,
         'configuration': {

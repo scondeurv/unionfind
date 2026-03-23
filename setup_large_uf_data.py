@@ -10,6 +10,7 @@ for density. Edges are undirected (stored as src→dst and dst→src in partitio
 import argparse
 import random
 import os
+import struct
 from collections import defaultdict
 
 import boto3
@@ -70,8 +71,13 @@ def write_local_file(edges, output_file):
     print(f"  ✅ Written {len(edges)} edges ({size_mb:.1f} MB)")
 
 
-def partition_and_upload_s3(edges, num_partitions, bucket, key, endpoint,
-                            access_key="minioadmin", secret_key="minioadmin"):
+def _vertex_partition(node: int, num_partitions: int, num_nodes: int) -> int:
+    return min(num_partitions - 1, (node * num_partitions) // max(1, num_nodes))
+
+
+def partition_and_upload_s3(edges, num_nodes, num_partitions, bucket, key, endpoint,
+                            access_key="minioadmin", secret_key="minioadmin",
+                            output_format="binary", partition_mode="vertex"):
     """Partition edges by source node and upload to S3."""
     print(f"Uploading to S3: {bucket}/{key}/ ({num_partitions} partitions)")
 
@@ -91,23 +97,37 @@ def partition_and_upload_s3(edges, num_partitions, bucket, key, endpoint,
         print(f"Creating bucket: {bucket}")
         s3.create_bucket(Bucket=bucket)
 
-    # Partition: each edge (u,v) goes to partition(u) AND partition(v) as reverse
+    # Partition:
+    # - vertex: assign edge to owner partition of src only (lower communication)
+    # - edge:   legacy mode, duplicate as reverse edge into dst partition too
     partitions = defaultdict(list)
     for src, dst in edges:
-        partitions[src % num_partitions].append((src, dst))
-        partitions[dst % num_partitions].append((dst, src))
+        if partition_mode == "vertex":
+            partitions[_vertex_partition(src, num_partitions, num_nodes)].append((src, dst))
+        else:
+            partitions[src % num_partitions].append((src, dst))
+            partitions[dst % num_partitions].append((dst, src))
 
     for part_id in range(num_partitions):
         part_edges = partitions.get(part_id, [])
         part_key = f"{key}/part-{part_id:05d}"
-        content = "\n".join(f"{s}\t{d}" for s, d in part_edges)
+        if output_format in ("tsv", "text"):
+            body = "\n".join(f"{s}\t{d}" for s, d in part_edges).encode('utf-8')
+            content_type = "text/plain"
+        else:
+            payload = bytearray()
+            for s, d in part_edges:
+                payload.extend(struct.pack('<I', s))
+                payload.extend(struct.pack('<I', d))
+            body = bytes(payload)
+            content_type = "application/octet-stream"
         s3.put_object(
             Bucket=bucket,
             Key=part_key,
-            Body=content.encode('utf-8'),
-            ContentType="text/plain"
+            Body=body,
+            ContentType=content_type
         )
-        print(f"  ✅ Partition {part_id}: {len(part_edges)} edges")
+        print(f"  ✅ Partition {part_id}: {len(part_edges)} edges, {len(body)} bytes ({output_format})")
 
     print(f"✅ Uploaded {num_partitions} partitions to s3://{bucket}/{key}/")
 
@@ -136,6 +156,10 @@ def main():
                         help="Skip local file (S3 only)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
+    parser.add_argument("--format", type=str, default="binary", choices=["binary", "tsv", "text"],
+                        help="Partition storage format in S3 (default: binary)")
+    parser.add_argument("--partition-mode", type=str, default="vertex", choices=["vertex", "edge"],
+                        help="Partition strategy: vertex (faster merge) or edge (legacy)")
 
     args = parser.parse_args()
 
@@ -165,8 +189,8 @@ def main():
     # Upload to S3
     if not args.no_s3:
         partition_and_upload_s3(
-            edges, args.partitions, args.bucket, args.key, args.endpoint,
-            access_key, secret_key
+            edges, args.nodes, args.partitions, args.bucket, args.key, args.endpoint,
+            access_key, secret_key, args.format, args.partition_mode
         )
 
     print(f"\n=== Done! ===")

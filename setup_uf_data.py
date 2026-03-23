@@ -10,6 +10,7 @@ import argparse
 import random
 import os
 import tempfile
+import struct
 from collections import defaultdict
 
 import boto3
@@ -73,7 +74,11 @@ def generate_graph(num_nodes: int, num_edges: int, num_components: int, seed: in
     return list(edges)
 
 
-def partition_edges(edges: list, num_partitions: int, num_nodes: int) -> dict:
+def _vertex_partition(node: int, num_partitions: int, num_nodes: int) -> int:
+    return min(num_partitions - 1, (node * num_partitions) // max(1, num_nodes))
+
+
+def partition_edges(edges: list, num_partitions: int, num_nodes: int, partition_mode: str = "edge") -> dict:
     """
     Partition edges by source node.
     
@@ -81,17 +86,21 @@ def partition_edges(edges: list, num_partitions: int, num_nodes: int) -> dict:
     """
     partitions = defaultdict(list)
     for src, dst in edges:
-        partition_id = src % num_partitions
-        partitions[partition_id].append((src, dst))
-        # Add reverse edge for undirected graph
-        reverse_partition_id = dst % num_partitions
-        partitions[reverse_partition_id].append((dst, src))
+        if partition_mode == "vertex":
+            partition_id = _vertex_partition(src, num_partitions, num_nodes)
+            partitions[partition_id].append((src, dst))
+        else:
+            partition_id = src % num_partitions
+            partitions[partition_id].append((src, dst))
+            # Add reverse edge for undirected graph
+            reverse_partition_id = dst % num_partitions
+            partitions[reverse_partition_id].append((dst, src))
     
     return partitions
 
 
 def upload_to_s3(partitions: dict, bucket: str, key: str, endpoint: str, 
-                 access_key: str, secret_key: str):
+                 access_key: str, secret_key: str, output_format: str = "binary"):
     """Upload partitioned graph data to S3."""
     
     s3 = boto3.client(
@@ -112,13 +121,25 @@ def upload_to_s3(partitions: dict, bucket: str, key: str, endpoint: str,
     
     for partition_id, edges in partitions.items():
         part_key = f"{key}/part-{partition_id:05d}"
-        content = "\n".join(f"{src}\t{dst}" for src, dst in edges)
+        if output_format in ("tsv", "text"):
+            content = "\n".join(f"{src}\t{dst}" for src, dst in edges)
+            body = content.encode('utf-8')
+            content_type = "text/plain"
+            byte_size = len(body)
+        else:
+            body = bytearray()
+            for src, dst in edges:
+                body.extend(struct.pack('<I', src))
+                body.extend(struct.pack('<I', dst))
+            content_type = "application/octet-stream"
+            byte_size = len(body)
         
-        print(f"Uploading {part_key} ({len(edges)} edges, {len(content)} bytes)")
+        print(f"Uploading {part_key} ({len(edges)} edges, {byte_size} bytes, format={output_format})")
         s3.put_object(
             Bucket=bucket,
             Key=part_key,
-            Body=content.encode('utf-8')
+            Body=bytes(body),
+            ContentType=content_type
         )
     
     print(f"\nUploaded {len(partitions)} partitions to s3://{bucket}/{key}/")
@@ -141,6 +162,10 @@ def main():
                         help="S3 endpoint URL")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
+    parser.add_argument("--format", type=str, default="binary", choices=["binary", "tsv", "text"],
+                        help="Partition storage format in S3 (default: binary)")
+    parser.add_argument("--partition-mode", type=str, default="vertex", choices=["vertex", "edge"],
+                        help="Partition strategy: vertex (faster merge) or edge (legacy)")
     
     args = parser.parse_args()
     
@@ -165,7 +190,7 @@ def main():
     edges = generate_graph(args.nodes, args.edges, args.components, args.seed)
     
     # Partition edges
-    partitions = partition_edges(edges, args.partitions, args.nodes)
+    partitions = partition_edges(edges, args.partitions, args.nodes, args.partition_mode)
     
     # Print partition stats
     print("\nPartition statistics:")
@@ -174,7 +199,15 @@ def main():
     
     # Upload to S3
     print()
-    upload_to_s3(partitions, args.bucket, args.key, args.endpoint, access_key, secret_key)
+    upload_to_s3(
+        partitions,
+        args.bucket,
+        args.key,
+        args.endpoint,
+        access_key,
+        secret_key,
+        output_format=args.format,
+    )
     
     print(f"\n=== Done! ===")
     print(f"Run Union-Find with:")
@@ -183,7 +216,7 @@ def main():
     print(f"    --uf-endpoint http://minio-service.default.svc.cluster.local:9000 \\")
     print(f"    --partitions {args.partitions} --num-nodes {args.nodes} \\")
     print(f"    --bucket {args.bucket} --key {args.key} \\")
-    print(f"    --backend redis-list --granularity 1")
+    print(f"    --backend redis-list --granularity 1 --input-format {args.format}")
 
 
 if __name__ == "__main__":

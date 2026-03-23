@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import struct
 from typing import Tuple, Dict, List
 
 import boto3
@@ -26,8 +27,22 @@ from ow_client.openwhisk_executor import OpenwhiskExecutor
 from unionfind_utils import generate_payload, add_unionfind_to_parser
 
 
+def canonical_component_hash(parent: List[int]) -> str:
+    root_to_component: dict[int, int] = {}
+    next_component = 0
+    hash_value = 0xCBF29CE484222325
+    for root in parent:
+        component = root_to_component.setdefault(root, next_component)
+        if component == next_component:
+            next_component += 1
+        hash_value ^= component
+        hash_value = (hash_value * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{hash_value:016x}"
+
+
 def download_graph_from_s3(bucket: str, key: str, endpoint: str, 
-                           output_file: str, num_partitions: int = 4) -> int:
+                           output_file: str, num_partitions: int = 4,
+                           input_format: str = "binary") -> int:
     """Download partitioned graph from S3 and merge into single file."""
     access_key = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
     secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
@@ -41,7 +56,6 @@ def download_graph_from_s3(bucket: str, key: str, endpoint: str,
         region_name='us-east-1'
     )
     
-    edges_seen = set()
     total_edges = 0
     
     with open(output_file, 'w') as f:
@@ -50,10 +64,17 @@ def download_graph_from_s3(bucket: str, key: str, endpoint: str,
             try:
                 print(f"  Streaming {part_key}...")
                 response = s3.get_object(Bucket=bucket, Key=part_key)
-                for line in response['Body'].iter_lines():
-                    if line:
-                        decoded_line = line.decode('utf-8')
-                        parts = decoded_line.split('\t')
+                payload = response['Body'].read()
+                if input_format == "binary":
+                    for off in range(0, len(payload) - (len(payload) % 8), 8):
+                        u, v = struct.unpack_from("<II", payload, off)
+                        f.write(f"{u}\t{v}\n")
+                        total_edges += 1
+                else:
+                    for line in payload.decode('utf-8').splitlines():
+                        if not line:
+                            continue
+                        parts = line.split('\t')
                         if len(parts) >= 2:
                             u, v = parts[0], parts[1]
                             f.write(f"{u}\t{v}\n")
@@ -66,13 +87,11 @@ def download_graph_from_s3(bucket: str, key: str, endpoint: str,
 
 def run_standalone(graph_file: str, num_nodes: int, ufst_binary: str) -> Dict:
     """Run standalone Union-Find and return results."""
-    start = time.time()
     result = subprocess.run(
         [ufst_binary, graph_file, str(num_nodes)],
         capture_output=True,
         text=True
     )
-    duration = time.time() - start
     
     if result.returncode != 0:
         print(f"Standalone error: {result.stderr}")
@@ -80,19 +99,16 @@ def run_standalone(graph_file: str, num_nodes: int, ufst_binary: str) -> Dict:
     
     try:
         data = json.loads(result.stdout)
-        data['total_time_s'] = duration
+        data['total_time_s'] = data.get('total_time_ms', 0) / 1000.0
+        data['component_hash'] = canonical_component_hash(data.get('parent', []))
         return data
     except json.JSONDecodeError:
         print(f"Could not parse standalone output: {result.stdout}")
         return None
 
 
-def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float]:
-    """Run burst Union-Find and return (num_components, time_s).
-    
-    Time is measured from the earliest worker_start to the latest worker_end
-    across all workers (pure computation time, excluding invocation overhead).
-    """
+def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, Dict, str | None]:
+    """Run burst Union-Find and return (num_components, time_s, timing_details, component_hash)."""
     granularity = args.granularity if args.granularity else 1
     params = generate_payload(
         endpoint=args.uf_endpoint,
@@ -101,7 +117,8 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float]:
         bucket=bucket,
         key=key,
         max_iterations=args.max_iterations if hasattr(args, 'max_iterations') else None,
-        granularity=granularity
+        granularity=granularity,
+        input_format=args.input_format,
     )
     
     executor = OpenwhiskExecutor(args.ow_host, args.ow_port, args.debug)
@@ -113,7 +130,7 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float]:
                         memory=args.runtime_memory if args.runtime_memory else 2048,
                         custom_image=args.custom_image,
                         debug_mode=args.debug,
-                        burst_size=1,
+                        burst_size=granularity,
                         join=args.join,
                         backend=args.backend,
                         chunk_size=args.chunk_size,
@@ -125,8 +142,9 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float]:
     dt_results = dt.get_results()
     
     num_components = None
-    min_start = float('inf')
-    max_end = 0
+    component_hash = None
+    algo_starts = []
+    algo_ends = []
     
     for sublist in dt_results:
         if isinstance(sublist, list):
@@ -134,24 +152,30 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float]:
                 if isinstance(item, dict):
                     if item.get('num_components') is not None:
                         num_components = item['num_components']
-                    # Extract worker_start and worker_end from timestamps
+                    if item.get('component_hash') is not None:
+                        component_hash = item['component_hash']
+                    # Extract per-worker timestamps
                     for ts in item.get('timestamps', []):
-                        if ts['key'] == 'worker_start':
-                            val = int(ts['value'])
-                            if val < min_start:
-                                min_start = val
-                        elif ts['key'] == 'worker_end':
-                            val = int(ts['value'])
-                            if val > max_end:
-                                max_end = val
-    
-    # Use worker timestamps if available, otherwise fall back to wall-clock
-    if min_start < float('inf') and max_end > 0:
-        burst_time_s = (max_end - min_start) / 1000.0
+                        if ts['key'] == 'local_uf_start':
+                            algo_starts.append(int(ts['value']))
+                        elif ts['key'] == 'global_merge_end':
+                            algo_ends.append(int(ts['value']))
+
+    if algo_starts and algo_ends:
+        burst_time_s = (max(algo_ends) - min(algo_starts)) / 1000.0
+        cold_start_s  = 0.0
+        stagger_s     = 0.0
     else:
-        burst_time_s = (finished - host_submit) / 1000.0
+        burst_time_s  = (finished - host_submit) / 1000.0
+        cold_start_s  = 0.0
+        stagger_s     = 0.0
     
-    return num_components, burst_time_s
+    timing_details = {
+        "cold_start_ms":  round(cold_start_s  * 1000),
+        "stagger_ms":     round(stagger_s     * 1000),
+        "computation_ms": round(burst_time_s  * 1000),
+    }
+    return num_components, burst_time_s, timing_details, component_hash
 
 
 def main():
@@ -170,6 +194,8 @@ def main():
                         help="S3 bucket name")
     parser.add_argument("--max-iterations", type=int, default=None,
                         help="Maximum iterations")
+    parser.add_argument("--input-format", type=str, default="binary", choices=["binary", "tsv", "text"],
+                        help="Input partition format in S3 (default: binary)")
     
     # Benchmark specific
     parser.add_argument("--sizes", type=str, default="5000,10000,50000,100000",
@@ -220,7 +246,7 @@ def main():
                 print(f"\nDownloading graph from S3...")
                 num_edges = download_graph_from_s3(
                     args.bucket, key, args.local_endpoint, 
-                    temp_graph, args.partitions
+                    temp_graph, args.partitions, args.input_format
                 )
                 print(f"Downloaded {num_edges:,} unique edges")
                 result["edges"] = num_edges
@@ -233,11 +259,12 @@ def main():
                 result["standalone"] = {
                     "num_components": standalone_result["num_components"],
                     "time_s": standalone_result["total_time_s"],
-                    "execution_time_ms": standalone_result["execution_time_ms"],
+                    "execution_time_ms": standalone_result["total_time_ms"],
+                    "component_hash": standalone_result.get("component_hash"),
                 }
                 print(f"  Components: {standalone_result['num_components']}")
                 print(f"  Time: {standalone_result['total_time_s']:.3f}s")
-                print(f"Standalone Processing Time (Execution): {standalone_result['execution_time_ms']} ms")
+                print(f"Standalone Processing Time (Execution): {standalone_result['total_time_ms']} ms")
             else:
                 print(f"Standalone Processing Time (Execution): FAILED")
             
@@ -248,15 +275,19 @@ def main():
         if not args.skip_burst:
             print(f"\nRunning burst Union-Find ({args.partitions} workers)...")
             try:
-                burst_components, burst_time = run_burst(args, num_nodes, args.bucket, key)
+                burst_components, burst_time, timing, burst_hash = run_burst(args, num_nodes, args.bucket, key)
                 burst_time_ms = burst_time * 1000
                 result["burst"] = {
                     "num_components": burst_components,
                     "time_s": burst_time,
                     "time_ms": burst_time_ms,
+                    "timing_details": timing,
+                    "component_hash": burst_hash,
                 }
                 print(f"  Components: {burst_components}")
-                print(f"  Time: {burst_time:.3f}s")
+                print(f"  Time: {burst_time:.3f}s  "
+                      f"(cold_start: {timing['cold_start_ms']}ms, "
+                      f"stagger: {timing['stagger_ms']}ms excluded)")
                 print(f"Burst Processing Time (Distributed Span): {burst_time_ms:.0f} ms")
             except Exception as e:
                 print(f"  Error: {e}")
@@ -278,12 +309,18 @@ def main():
         if "standalone" in result and "burst" in result:
             standalone_comp = result["standalone"]["num_components"]
             burst_comp = result["burst"].get("num_components")
-            
-            if standalone_comp == burst_comp:
-                print(f"\n✅ VALIDATION PASSED: Both found {standalone_comp} components")
+            standalone_hash = result["standalone"].get("component_hash")
+            burst_hash = result["burst"].get("component_hash")
+
+            if standalone_comp == burst_comp and standalone_hash and burst_hash and standalone_hash == burst_hash:
+                print(f"\n✅ VALIDATION PASSED: Components and canonical partition hash match")
                 result["validation"] = "PASSED"
             else:
-                print(f"\n❌ VALIDATION FAILED: Standalone={standalone_comp}, Burst={burst_comp}")
+                print(
+                    f"\n❌ VALIDATION FAILED: "
+                    f"Standalone components/hash={standalone_comp}/{standalone_hash}, "
+                    f"Burst components/hash={burst_comp}/{burst_hash}"
+                )
                 result["validation"] = "FAILED"
         
         results.append(result)

@@ -34,7 +34,8 @@ if __name__ == "__main__":
         bucket=args.bucket,
         key=args.key,
         max_iterations=args.max_iterations,
-        granularity=args.granularity
+        granularity=args.granularity,
+        input_format=args.input_format,
     )
 
     executor = OpenwhiskExecutor(args.ow_host, args.ow_port, args.debug)
