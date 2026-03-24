@@ -33,12 +33,78 @@ EDGES_PER_NODE = 5
 COMPONENTS = 10
 PYTHON_CMD = os.environ.get("VALIDATION_PYTHON", sys.executable)
 FLUSH_CMD = os.environ.get("UF_FLUSH_CMD", "kubectl exec pod/dragonfly -- redis-cli FLUSHALL")
+BENCHMARK_JSON_PREFIX = "BENCHMARK_RESULT_JSON:"
+OUTPUT_FILE = "uf_crossover_validation_results.json"
 
 
 def log(message):
     """Print with timestamp."""
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {message}", flush=True)
+
+
+def crossing_intervals(results, x_key):
+    intervals = []
+    for idx in range(1, len(results)):
+        prev = results[idx - 1]
+        curr = results[idx]
+        prev_speedup = prev.get("speedup")
+        curr_speedup = curr.get("speedup")
+        if prev_speedup is None or curr_speedup is None:
+            continue
+        if (prev_speedup - 1.0) * (curr_speedup - 1.0) <= 0 and prev_speedup != curr_speedup:
+            intervals.append((prev, curr))
+    return intervals
+
+
+def estimate_crossover(results, x_key):
+    intervals = crossing_intervals(results, x_key)
+    upward = [(prev, curr) for prev, curr in intervals if prev["speedup"] < 1.0 <= curr["speedup"]]
+    if len(upward) != 1:
+        return None, intervals
+    prev, curr = upward[0]
+    m = (curr["speedup"] - prev["speedup"]) / (curr[x_key] - prev[x_key])
+    b = prev["speedup"] - m * prev[x_key]
+    return (1.0 - b) / m, intervals
+
+
+def save_checkpoint(results):
+    if not results:
+        return
+    output_data = {
+        'timestamp': datetime.now().isoformat(),
+        'test_points': TEST_POINTS,
+        'runs_per_point': RUNS,
+        'results': results,
+        'crossover_estimate': None,
+        'crossing_intervals': [],
+        'crossover_warning': None,
+        'configuration': {
+            'partitions': PARTITIONS,
+            'memory_mb': MEMORY,
+            'edges_per_node': EDGES_PER_NODE,
+            'components': COMPONENTS
+        }
+    }
+    with open(OUTPUT_FILE, 'w') as f:
+        json.dump(output_data, f, indent=2)
+    log(f"💾 Checkpoint saved: {OUTPUT_FILE}")
+
+
+def load_checkpoint():
+    if not os.path.exists(OUTPUT_FILE):
+        return []
+    try:
+        with open(OUTPUT_FILE) as f:
+            data = json.load(f)
+        results = data.get("results", [])
+        if not isinstance(results, list):
+            log("⚠️  Invalid checkpoint format, ignoring partial file")
+            return []
+        return results
+    except Exception as exc:
+        log(f"⚠️  Could not load checkpoint, ignoring partial file: {exc}")
+        return []
 
 
 def generate_graph(nodes):
@@ -114,21 +180,21 @@ def run_benchmark(nodes, skip_generate=False):
         log(f"❌ Benchmark failed for {nodes/1e6:.1f}M nodes")
         return None
 
-    # Parse canonical timing lines
-    standalone_time = None
-    burst_time = None
+    benchmark_summary = None
+    for line in full_output.splitlines():
+        if line.startswith(BENCHMARK_JSON_PREFIX):
+            try:
+                benchmark_summary = json.loads(line[len(BENCHMARK_JSON_PREFIX):])
+            except json.JSONDecodeError as exc:
+                log(f"⚠️  Could not decode benchmark JSON: {exc}")
+            break
 
-    for line in full_output.split('\n'):
-        if 'Standalone Processing Time (Execution):' in line:
-            try:
-                standalone_time = float(line.split(':')[1].strip().split()[0])
-            except Exception:
-                pass
-        if 'Burst Processing Time (Distributed Span):' in line:
-            try:
-                burst_time = float(line.split(':')[1].strip().split()[0])
-            except Exception:
-                pass
+    if benchmark_summary is None:
+        log("⚠️  Benchmark did not emit structured JSON summary")
+        return None
+
+    standalone_time = benchmark_summary.get("standalone", {}).get("execution_time_ms")
+    burst_time = benchmark_summary.get("burst", {}).get("processing_time_ms")
 
     if standalone_time and burst_time:
         speedup = standalone_time / burst_time
@@ -143,9 +209,13 @@ def run_benchmark(nodes, skip_generate=False):
         return {
             'nodes': nodes,
             'standalone_ms': standalone_time,
+            'standalone_total_ms': benchmark_summary.get("standalone", {}).get("total_time_ms"),
             'burst_ms': burst_time,
+            'burst_total_ms': benchmark_summary.get("burst", {}).get("total_time_ms"),
             'speedup': speedup,
-            'winner': winner
+            'speedup_total': benchmark_summary.get("speedup", {}).get("overall"),
+            'winner': winner,
+            'validation': benchmark_summary.get("validation", {}),
         }
 
     log(f"⚠️  Could not parse results")
@@ -165,11 +235,20 @@ def main():
     log(f"Python runner: {PYTHON_CMD}")
     log("=" * 80)
 
-    results = []
+    results = load_checkpoint()
+    completed_nodes = {entry["nodes"] for entry in results}
+    if completed_nodes:
+        log(f"♻️  Resuming from checkpoint: completed nodes = {sorted(completed_nodes)}")
 
     for nodes in TEST_POINTS:
+        if nodes in completed_nodes:
+            log(f"⏭️  Skipping {nodes/1e6:.1f}M nodes (already checkpointed)")
+            continue
         sa_times = []
         bs_times = []
+        sa_total_times = []
+        bs_total_times = []
+        validation_state = None
 
         for run_idx in range(RUNS):
             log(f"\n▶ Run {run_idx + 1}/{RUNS} — {nodes/1e6:.1f}M nodes")
@@ -177,6 +256,11 @@ def main():
             if result:
                 sa_times.append(result["standalone_ms"])
                 bs_times.append(result["burst_ms"])
+                if result.get("standalone_total_ms") is not None:
+                    sa_total_times.append(result["standalone_total_ms"])
+                if result.get("burst_total_ms") is not None:
+                    bs_total_times.append(result["burst_total_ms"])
+                validation_state = result.get("validation")
             else:
                 log(f"⚠️  Run {run_idx + 1} failed, skipping")
             if run_idx < RUNS - 1:
@@ -190,7 +274,12 @@ def main():
         bs_mean = statistics.mean(bs_times)
         sa_std = statistics.stdev(sa_times) if len(sa_times) > 1 else 0.0
         bs_std = statistics.stdev(bs_times) if len(bs_times) > 1 else 0.0
+        sa_total_mean = statistics.mean(sa_total_times) if sa_total_times else None
+        bs_total_mean = statistics.mean(bs_total_times) if bs_total_times else None
         speedup = sa_mean / bs_mean if bs_mean > 0 else 0.0
+        speedup_total = None
+        if sa_total_mean is not None and bs_total_mean not in (None, 0):
+            speedup_total = sa_total_mean / bs_total_mean
         winner = "Burst" if speedup > 1.0 else "Standalone"
 
         log(f"\n📊 Aggregate {nodes/1e6:.1f}M ({len(sa_times)} runs):")
@@ -207,8 +296,13 @@ def main():
             "burst_std_ms": round(bs_std, 2),
             "burst_runs_ms": bs_times,
             "speedup": round(speedup, 4),
+            "standalone_total_ms": round(sa_total_mean, 2) if sa_total_mean is not None else None,
+            "burst_total_ms": round(bs_total_mean, 2) if bs_total_mean is not None else None,
+            "speedup_total": round(speedup_total, 4) if speedup_total is not None else None,
             "winner": winner,
+            "validation": validation_state or {},
         })
+        save_checkpoint(results)
 
         time.sleep(5)
 
@@ -219,8 +313,7 @@ def main():
     log(f"{'Nodes':>12} {'SA mean':>12} {'SA std':>9} {'BS mean':>12} {'BS std':>9} {'Speedup':>10} {'Winner':>12}")
     log("-" * 80)
 
-    crossover_found = False
-    crossover_point = None
+    crossover_point, intervals = estimate_crossover(results, "nodes")
 
     for i, r in enumerate(results):
         log(
@@ -233,22 +326,19 @@ def main():
             f"{r['winner']:>12}"
         )
 
-        # Detect crossover via linear interpolation
-        if i > 0 and not crossover_found:
-            prev = results[i - 1]
-            if prev['speedup'] < 1.0 and r['speedup'] >= 1.0:
-                crossover_found = True
-                m = (r['speedup'] - prev['speedup']) / (r['nodes'] - prev['nodes'])
-                b = prev['speedup'] - m * prev['nodes']
-                crossover_point = (1.0 - b) / m
-                log("-" * 80)
-                log(f"📍 CROSSOVER DETECTED between "
-                    f"{prev['nodes']/1e6:.1f}M and {r['nodes']/1e6:.1f}M")
-                log(f"📍 Refined estimate: {crossover_point/1e6:.2f}M nodes")
-                log("-" * 80)
+    if crossover_point is not None:
+        prev, curr = [pair for pair in intervals if pair[0]["speedup"] < 1.0 <= pair[1]["speedup"]][0]
+        log("-" * 80)
+        log(f"📍 CROSSOVER DETECTED between "
+            f"{prev['nodes']/1e6:.1f}M and {curr['nodes']/1e6:.1f}M")
+        log(f"📍 Refined estimate: {crossover_point/1e6:.2f}M nodes")
+        log("-" * 80)
+    elif len(intervals) > 1:
+        log("⚠️  Multiple speedup sign changes detected; crossover estimate omitted as ambiguous")
 
     log("=" * 80)
 
+    crossover_found = crossover_point is not None
     if not crossover_found and results:
         last = results[-1]
         if last['speedup'] < 1.0:
@@ -265,6 +355,8 @@ def main():
         'runs_per_point': RUNS,
         'results': results,
         'crossover_estimate': crossover_point,
+        'crossing_intervals': [[prev['nodes'], curr['nodes']] for prev, curr in intervals],
+        'crossover_warning': 'multiple_sign_changes' if len(intervals) > 1 else None,
         'configuration': {
             'partitions': PARTITIONS,
             'memory_mb': MEMORY,
@@ -273,10 +365,10 @@ def main():
         }
     }
 
-    with open('uf_crossover_validation_results.json', 'w') as f:
+    with open(OUTPUT_FILE, 'w') as f:
         json.dump(output_data, f, indent=2)
 
-    log(f"💾 Results saved: uf_crossover_validation_results.json")
+    log(f"💾 Results saved: {OUTPUT_FILE}")
     log("✅ CROSSOVER VALIDATION COMPLETE")
 
 

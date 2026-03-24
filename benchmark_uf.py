@@ -26,6 +26,8 @@ from ow_client.time_helper import get_millis
 from ow_client.openwhisk_executor import OpenwhiskExecutor
 from unionfind_utils import generate_payload, add_unionfind_to_parser
 
+BENCHMARK_JSON_PREFIX = "BENCHMARK_RESULT_JSON:"
+
 
 def canonical_component_hash(parent: List[int]) -> str:
     root_to_component: dict[int, int] = {}
@@ -107,8 +109,8 @@ def run_standalone(graph_file: str, num_nodes: int, ufst_binary: str) -> Dict:
         return None
 
 
-def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, Dict, str | None]:
-    """Run burst Union-Find and return (num_components, time_s, timing_details, component_hash)."""
+def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, float, Dict, str | None]:
+    """Run burst Union-Find and return (num_components, algo_time_s, total_time_s, timing_details, component_hash)."""
     granularity = args.granularity if args.granularity else 1
     params = generate_payload(
         endpoint=args.uf_endpoint,
@@ -143,6 +145,7 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
     
     num_components = None
     component_hash = None
+    worker_starts = []
     algo_starts = []
     algo_ends = []
     
@@ -156,26 +159,83 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
                         component_hash = item['component_hash']
                     # Extract per-worker timestamps
                     for ts in item.get('timestamps', []):
-                        if ts['key'] == 'local_uf_start':
+                        if ts['key'] == 'worker_start':
+                            worker_starts.append(int(ts['value']))
+                        elif ts['key'] == 'local_uf_start':
                             algo_starts.append(int(ts['value']))
                         elif ts['key'] == 'global_merge_end':
                             algo_ends.append(int(ts['value']))
 
+    total_time_s = (finished - host_submit) / 1000.0
     if algo_starts and algo_ends:
         burst_time_s = (max(algo_ends) - min(algo_starts)) / 1000.0
-        cold_start_s  = 0.0
-        stagger_s     = 0.0
     else:
-        burst_time_s  = (finished - host_submit) / 1000.0
-        cold_start_s  = 0.0
-        stagger_s     = 0.0
+        burst_time_s  = total_time_s
+
+    if worker_starts:
+        cold_start_s = max(0.0, (min(worker_starts) - host_submit) / 1000.0)
+        stagger_s = max(0.0, (max(worker_starts) - min(worker_starts)) / 1000.0)
+    else:
+        cold_start_s = 0.0
+        stagger_s = 0.0
     
     timing_details = {
         "cold_start_ms":  round(cold_start_s  * 1000),
         "stagger_ms":     round(stagger_s     * 1000),
         "computation_ms": round(burst_time_s  * 1000),
+        "total_ms": round(total_time_s * 1000),
     }
-    return num_components, burst_time_s, timing_details, component_hash
+    return num_components, burst_time_s, total_time_s, timing_details, component_hash
+
+
+def build_benchmark_summary(result: Dict) -> Dict:
+    standalone = result.get("standalone", {})
+    burst = result.get("burst", {})
+    standalone_exec_ms = standalone.get("execution_time_ms")
+    standalone_total_ms = standalone.get("total_time_ms", standalone_exec_ms)
+    burst_algo_ms = burst.get("processing_time_ms", burst.get("time_ms"))
+    burst_total_ms = burst.get("total_time_ms", burst.get("time_ms"))
+
+    algo_speedup = None
+    total_speedup = None
+    if standalone_exec_ms not in (None, 0) and burst_algo_ms not in (None, 0):
+        algo_speedup = standalone_exec_ms / burst_algo_ms
+    if standalone_total_ms not in (None, 0) and burst_total_ms not in (None, 0):
+        total_speedup = standalone_total_ms / burst_total_ms
+
+    return {
+        "algorithm": "unionfind",
+        "dataset": {
+            "nodes": result.get("nodes"),
+            "s3_prefix": f"uf-graphs/uf-{result.get('nodes')}",
+        },
+        "configuration": {
+            "partitions": result.get("partitions"),
+        },
+        "standalone": {
+            "execution_time_ms": standalone_exec_ms,
+            "total_time_ms": standalone_total_ms,
+            "num_components": standalone.get("num_components"),
+            "component_hash": standalone.get("component_hash"),
+        },
+        "burst": {
+            "processing_time_ms": burst_algo_ms,
+            "total_time_ms": burst_total_ms,
+            "num_components": burst.get("num_components"),
+            "component_hash": burst.get("component_hash"),
+            "timing_details": burst.get("timing_details"),
+        },
+        "speedup": {
+            "algorithmic": algo_speedup,
+            "overall": total_speedup,
+        },
+        "validation": {
+            "requested": "standalone" in result and "burst" in result,
+            "performed": "validation" in result,
+            "passed": result.get("validation") == "PASSED",
+            "skipped_reason": None if "validation" in result else "validation not available",
+        },
+    }
 
 
 def main():
@@ -259,12 +319,14 @@ def main():
                 result["standalone"] = {
                     "num_components": standalone_result["num_components"],
                     "time_s": standalone_result["total_time_s"],
-                    "execution_time_ms": standalone_result["total_time_ms"],
+                    "execution_time_ms": standalone_result["execution_time_ms"],
+                    "total_time_ms": standalone_result["total_time_ms"],
                     "component_hash": standalone_result.get("component_hash"),
                 }
                 print(f"  Components: {standalone_result['num_components']}")
                 print(f"  Time: {standalone_result['total_time_s']:.3f}s")
-                print(f"Standalone Processing Time (Execution): {standalone_result['total_time_ms']} ms")
+                print(f"Standalone Processing Time (Execution): {standalone_result['execution_time_ms']} ms")
+                print(f"Standalone Time (Total): {standalone_result['total_time_ms']} ms")
             else:
                 print(f"Standalone Processing Time (Execution): FAILED")
             
@@ -275,28 +337,37 @@ def main():
         if not args.skip_burst:
             print(f"\nRunning burst Union-Find ({args.partitions} workers)...")
             try:
-                burst_components, burst_time, timing, burst_hash = run_burst(args, num_nodes, args.bucket, key)
+                burst_components, burst_time, burst_total_time, timing, burst_hash = run_burst(args, num_nodes, args.bucket, key)
                 burst_time_ms = burst_time * 1000
+                burst_total_ms = burst_total_time * 1000
                 result["burst"] = {
                     "num_components": burst_components,
                     "time_s": burst_time,
                     "time_ms": burst_time_ms,
+                    "total_time_s": burst_total_time,
+                    "total_time_ms": burst_total_ms,
+                    "processing_time_ms": burst_time_ms,
                     "timing_details": timing,
                     "component_hash": burst_hash,
                 }
                 print(f"  Components: {burst_components}")
+                print(f"  Time: {burst_total_time:.3f}s total")
                 print(f"  Time: {burst_time:.3f}s  "
                       f"(cold_start: {timing['cold_start_ms']}ms, "
-                      f"stagger: {timing['stagger_ms']}ms excluded)")
+                      f"stagger: {timing['stagger_ms']}ms included in total)")
+                print(f"Burst Time (Total): {burst_total_ms:.0f} ms")
                 print(f"Burst Processing Time (Distributed Span): {burst_time_ms:.0f} ms")
             except Exception as e:
                 print(f"  Error: {e}")
                 result["burst"] = {"error": str(e)}
+                print(f"Burst Time (Total): FAILED")
                 print(f"Burst Processing Time (Distributed Span): FAILED")
         
         # Compute speedups
         st_exec_ms = result.get("standalone", {}).get("execution_time_ms")
+        st_total_ms = result.get("standalone", {}).get("total_time_ms")
         bt_ms = result.get("burst", {}).get("time_ms")
+        bt_total_ms = result.get("burst", {}).get("total_time_ms")
         if st_exec_ms and bt_ms and bt_ms > 0:
             algo_speedup = st_exec_ms / bt_ms
             print(f"\nAlgorithmic Speedup: {algo_speedup:.2f}x")
@@ -304,6 +375,9 @@ def main():
                 print("✓ Burst is faster!")
             else:
                 print("✗ Standalone is faster")
+        if st_total_ms and bt_total_ms and bt_total_ms > 0:
+            total_speedup = st_total_ms / bt_total_ms
+            print(f"Overall Speedup (Total): {total_speedup:.2f}x")
         
         # Validate
         if "standalone" in result and "burst" in result:
@@ -322,6 +396,8 @@ def main():
                     f"Burst components/hash={burst_comp}/{burst_hash}"
                 )
                 result["validation"] = "FAILED"
+
+        print(f"{BENCHMARK_JSON_PREFIX}{json.dumps(build_benchmark_summary(result), sort_keys=True)}")
         
         results.append(result)
     
