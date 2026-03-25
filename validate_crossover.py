@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Validate crossover point for Union-Find: Standalone vs Burst.
+Validate Union-Find on the common graph-size grid used in the TFM.
 
-Runs strategic test points to find where burst becomes faster than standalone.
-Based on known data (5M: standalone ~1.76s, burst ~5.3s), crossover is estimated
-around 10-15M nodes. We test points around that range.
+Runs the same size progression as the other comparable graph algorithms so the
+experimental section can discuss them on a homogeneous scale up to 5M nodes.
 """
 import subprocess
 import json
@@ -14,13 +13,13 @@ import sys
 import time
 from datetime import datetime
 
-# Strategic test points around estimated crossover
 TEST_POINTS = [
-    5000000,    # 5M  - Standalone wins clearly
-    8000000,    # 8M  - Getting closer
-    10000000,   # 10M - Near crossover
-    12000000,   # 12M - Near crossover
-    15000000,   # 15M - Burst should win
+    100_000,
+    500_000,
+    1_000_000,
+    2_000_000,
+    3_000_000,
+    5_000_000,
 ]
 RUNS = 5
 
@@ -193,27 +192,40 @@ def run_benchmark(nodes, skip_generate=False):
         log("⚠️  Benchmark did not emit structured JSON summary")
         return None
 
-    standalone_time = benchmark_summary.get("standalone", {}).get("execution_time_ms")
-    burst_time = benchmark_summary.get("burst", {}).get("processing_time_ms")
+    standalone_exec = benchmark_summary.get("standalone", {}).get("execution_time_ms")
+    standalone_time = benchmark_summary.get("standalone", {}).get("total_time_ms")
+    burst_span = benchmark_summary.get("burst", {}).get("processing_time_ms")
+    burst_time = benchmark_summary.get("burst", {}).get("total_time_ms")
+    burst_host_total = benchmark_summary.get("burst", {}).get("timing_details", {}).get("total_ms")
 
-    if standalone_time and burst_time:
+    if standalone_exec and standalone_time and burst_time:
+        speedup_span = standalone_exec / burst_span if burst_span not in (None, 0) else None
         speedup = standalone_time / burst_time
         log(f"\n📊 Results for {nodes/1e6:.1f}M nodes:")
-        log(f"   Standalone: {standalone_time:.2f} ms")
-        log(f"   Burst:      {burst_time:.2f} ms")
-        log(f"   Speedup:    {speedup:.2f}x")
+        log(f"   Standalone (load + exec): {standalone_time:.2f} ms")
+        log(f"   Burst warm total:         {burst_time:.2f} ms")
+        if burst_span is not None:
+            log(f"   Burst span:               {burst_span:.2f} ms")
+        log(f"   Speedup (warm): {speedup:.2f}x")
+        if speedup_span is not None:
+            log(f"   Speedup (span): {speedup_span:.2f}x")
 
         winner = "Burst" if speedup > 1.0 else "Standalone"
         log(f"   Winner:     {winner} ✅")
 
         return {
             'nodes': nodes,
-            'standalone_ms': standalone_time,
-            'standalone_total_ms': benchmark_summary.get("standalone", {}).get("total_time_ms"),
-            'burst_ms': burst_time,
-            'burst_total_ms': benchmark_summary.get("burst", {}).get("total_time_ms"),
-            'speedup': speedup,
-            'speedup_total': benchmark_summary.get("speedup", {}).get("overall"),
+            'standalone_ms': standalone_exec,
+            'standalone_exec_ms': standalone_exec,
+            'standalone_total_ms': standalone_time,
+            'burst_ms': burst_span,
+            'burst_total_ms': burst_host_total,
+            'burst_warm_ms': burst_time,
+            'burst_span_ms': burst_span,
+            'speedup': speedup_span,
+            'speedup_total': benchmark_summary.get("standalone", {}).get("total_time_ms") / burst_host_total if burst_host_total not in (None, 0) else None,
+            'speedup_warm': speedup,
+            'speedup_span': speedup_span,
             'winner': winner,
             'validation': benchmark_summary.get("validation", {}),
         }
@@ -244,9 +256,10 @@ def main():
         if nodes in completed_nodes:
             log(f"⏭️  Skipping {nodes/1e6:.1f}M nodes (already checkpointed)")
             continue
-        sa_times = []
-        bs_times = []
+        sa_exec_times = []
+        bs_span_times = []
         sa_total_times = []
+        bs_warm_times = []
         bs_total_times = []
         validation_state = None
 
@@ -254,10 +267,12 @@ def main():
             log(f"\n▶ Run {run_idx + 1}/{RUNS} — {nodes/1e6:.1f}M nodes")
             result = run_benchmark(nodes, skip_generate=run_idx > 0)
             if result:
-                sa_times.append(result["standalone_ms"])
-                bs_times.append(result["burst_ms"])
+                sa_exec_times.append(result["standalone_ms"])
+                bs_span_times.append(result["burst_ms"])
                 if result.get("standalone_total_ms") is not None:
                     sa_total_times.append(result["standalone_total_ms"])
+                if result.get("burst_warm_ms") is not None:
+                    bs_warm_times.append(result["burst_warm_ms"])
                 if result.get("burst_total_ms") is not None:
                     bs_total_times.append(result["burst_total_ms"])
                 validation_state = result.get("validation")
@@ -266,39 +281,49 @@ def main():
             if run_idx < RUNS - 1:
                 time.sleep(3)
 
-        if not sa_times:
+        if not sa_exec_times or not sa_total_times or not bs_warm_times:
             log(f"⚠️  All runs failed for {nodes/1e6:.1f}M, skipping point")
             continue
 
-        sa_mean = statistics.mean(sa_times)
-        bs_mean = statistics.mean(bs_times)
-        sa_std = statistics.stdev(sa_times) if len(sa_times) > 1 else 0.0
-        bs_std = statistics.stdev(bs_times) if len(bs_times) > 1 else 0.0
-        sa_total_mean = statistics.mean(sa_total_times) if sa_total_times else None
+        sa_exec_mean = statistics.mean(sa_exec_times)
+        bs_span_mean = statistics.mean(bs_span_times)
+        sa_exec_std = statistics.stdev(sa_exec_times) if len(sa_exec_times) > 1 else 0.0
+        bs_span_std = statistics.stdev(bs_span_times) if len(bs_span_times) > 1 else 0.0
+        sa_total_mean = statistics.mean(sa_total_times)
+        bs_warm_mean = statistics.mean(bs_warm_times)
+        sa_total_std = statistics.stdev(sa_total_times) if len(sa_total_times) > 1 else 0.0
+        bs_warm_std = statistics.stdev(bs_warm_times) if len(bs_warm_times) > 1 else 0.0
         bs_total_mean = statistics.mean(bs_total_times) if bs_total_times else None
-        speedup = sa_mean / bs_mean if bs_mean > 0 else 0.0
+        speedup = sa_exec_mean / bs_span_mean if bs_span_mean > 0 else 0.0
+        speedup_warm = sa_total_mean / bs_warm_mean if bs_warm_mean > 0 else 0.0
         speedup_total = None
         if sa_total_mean is not None and bs_total_mean not in (None, 0):
             speedup_total = sa_total_mean / bs_total_mean
-        winner = "Burst" if speedup > 1.0 else "Standalone"
+        winner = "Burst" if speedup_warm > 1.0 else "Standalone"
 
-        log(f"\n📊 Aggregate {nodes/1e6:.1f}M ({len(sa_times)} runs):")
-        log(f"   Standalone: {sa_mean:.1f} ± {sa_std:.1f} ms  (runs: {[f'{v:.0f}' for v in sa_times]})")
-        log(f"   Burst span: {bs_mean:.1f} ± {bs_std:.1f} ms  (runs: {[f'{v:.0f}' for v in bs_times]})")
-        log(f"   Speedup:    {speedup:.2f}x  →  {winner}")
+        log(f"\n📊 Aggregate {nodes/1e6:.1f}M ({len(sa_total_times)} runs):")
+        log(f"   Standalone total: {sa_total_mean:.1f} ± {sa_total_std:.1f} ms  (runs: {[f'{v:.0f}' for v in sa_total_times]})")
+        log(f"   Burst warm total: {bs_warm_mean:.1f} ± {bs_warm_std:.1f} ms  (runs: {[f'{v:.0f}' for v in bs_warm_times]})")
+        log(f"   Speedup (warm): {speedup_warm:.2f}x  →  {winner}")
+        log(f"   Span secondary: SA exec {sa_exec_mean:.1f} ± {sa_exec_std:.1f} ms vs Burst span {bs_span_mean:.1f} ± {bs_span_std:.1f} ms")
 
         results.append({
             "nodes": nodes,
-            "standalone_ms": round(sa_mean, 2),
-            "standalone_std_ms": round(sa_std, 2),
-            "standalone_runs_ms": sa_times,
-            "burst_ms": round(bs_mean, 2),
-            "burst_std_ms": round(bs_std, 2),
-            "burst_runs_ms": bs_times,
+            "standalone_ms": round(sa_exec_mean, 2),
+            "standalone_exec_ms": round(sa_exec_mean, 2),
+            "standalone_std_ms": round(sa_exec_std, 2),
+            "standalone_runs_ms": sa_exec_times,
+            "burst_ms": round(bs_span_mean, 2),
+            "burst_span_ms": round(bs_span_mean, 2),
+            "burst_std_ms": round(bs_span_std, 2),
+            "burst_runs_ms": bs_span_times,
             "speedup": round(speedup, 4),
+            "speedup_span": round(speedup, 4),
             "standalone_total_ms": round(sa_total_mean, 2) if sa_total_mean is not None else None,
             "burst_total_ms": round(bs_total_mean, 2) if bs_total_mean is not None else None,
             "speedup_total": round(speedup_total, 4) if speedup_total is not None else None,
+            "burst_warm_ms": round(bs_warm_mean, 2),
+            "speedup_warm": round(speedup_warm, 4),
             "winner": winner,
             "validation": validation_state or {},
         })

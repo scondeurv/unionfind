@@ -146,6 +146,7 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
     num_components = None
     component_hash = None
     worker_starts = []
+    worker_ends = []
     algo_starts = []
     algo_ends = []
     
@@ -161,16 +162,22 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
                     for ts in item.get('timestamps', []):
                         if ts['key'] == 'worker_start':
                             worker_starts.append(int(ts['value']))
+                        elif ts['key'] == 'worker_end':
+                            worker_ends.append(int(ts['value']))
                         elif ts['key'] == 'local_uf_start':
                             algo_starts.append(int(ts['value']))
                         elif ts['key'] == 'global_merge_end':
                             algo_ends.append(int(ts['value']))
 
     total_time_s = (finished - host_submit) / 1000.0
+    if worker_starts and worker_ends:
+        warm_total_s = (max(worker_ends) - min(worker_starts)) / 1000.0
+    else:
+        warm_total_s = total_time_s
     if algo_starts and algo_ends:
         burst_time_s = (max(algo_ends) - min(algo_starts)) / 1000.0
     else:
-        burst_time_s  = total_time_s
+        burst_time_s  = warm_total_s
 
     if worker_starts:
         cold_start_s = max(0.0, (min(worker_starts) - host_submit) / 1000.0)
@@ -183,6 +190,7 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
         "cold_start_ms":  round(cold_start_s  * 1000),
         "stagger_ms":     round(stagger_s     * 1000),
         "computation_ms": round(burst_time_s  * 1000),
+        "warm_total_ms":  round(warm_total_s  * 1000),
         "total_ms": round(total_time_s * 1000),
     }
     return num_components, burst_time_s, total_time_s, timing_details, component_hash
@@ -339,13 +347,15 @@ def main():
             try:
                 burst_components, burst_time, burst_total_time, timing, burst_hash = run_burst(args, num_nodes, args.bucket, key)
                 burst_time_ms = burst_time * 1000
-                burst_total_ms = burst_total_time * 1000
+                burst_host_total_ms = burst_total_time * 1000
+                burst_warm_total_ms = timing.get("warm_total_ms", burst_host_total_ms)
                 result["burst"] = {
                     "num_components": burst_components,
                     "time_s": burst_time,
                     "time_ms": burst_time_ms,
                     "total_time_s": burst_total_time,
-                    "total_time_ms": burst_total_ms,
+                    "total_time_ms": burst_warm_total_ms,
+                    "host_total_time_ms": burst_host_total_ms,
                     "processing_time_ms": burst_time_ms,
                     "timing_details": timing,
                     "component_hash": burst_hash,
@@ -355,7 +365,8 @@ def main():
                 print(f"  Time: {burst_time:.3f}s  "
                       f"(cold_start: {timing['cold_start_ms']}ms, "
                       f"stagger: {timing['stagger_ms']}ms included in total)")
-                print(f"Burst Time (Total): {burst_total_ms:.0f} ms")
+                print(f"Burst Time (Host Total / Cold): {burst_host_total_ms:.0f} ms")
+                print(f"Burst Time (Load + Execution / Warm): {burst_warm_total_ms:.0f} ms")
                 print(f"Burst Processing Time (Distributed Span): {burst_time_ms:.0f} ms")
             except Exception as e:
                 print(f"  Error: {e}")
