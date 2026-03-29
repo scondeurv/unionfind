@@ -18,6 +18,7 @@ from typing import Tuple, Dict, List
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -27,6 +28,7 @@ from ow_client.openwhisk_executor import OpenwhiskExecutor
 from unionfind_utils import generate_payload, add_unionfind_to_parser
 
 BENCHMARK_JSON_PREFIX = "BENCHMARK_RESULT_JSON:"
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def canonical_component_hash(parent: List[int]) -> str:
@@ -87,6 +89,72 @@ def download_graph_from_s3(bucket: str, key: str, endpoint: str,
     return total_edges
 
 
+def s3_partitions_available(bucket: str, key: str, endpoint: str, num_partitions: int) -> bool:
+    """Return True when every expected UF partition exists and is non-empty."""
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
+    s3 = boto3.client(
+        's3',
+        endpoint_url=endpoint if endpoint.startswith("http") else f"http://{endpoint}",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(signature_version='s3v4'),
+        region_name='us-east-1'
+    )
+    try:
+        present = 0
+        for part_id in range(num_partitions):
+            head = s3.head_object(Bucket=bucket, Key=f"{key}/part-{part_id:05d}")
+            if int(head.get("ContentLength", 0)) > 0:
+                present += 1
+        return present >= num_partitions
+    except (BotoCoreError, ClientError):
+        return False
+
+
+def ensure_input_data(args, num_nodes: int, key: str) -> str | None:
+    """Ensure the local graph and S3 partitions required by the benchmark exist."""
+    local_graph = args.graph_file or f"uf_graph_{num_nodes}.tsv"
+    need_local = not args.skip_standalone
+    need_s3 = not args.skip_burst
+    local_ready = os.path.exists(local_graph) and os.path.getsize(local_graph) > 0
+    s3_ready = s3_partitions_available(args.bucket, key, args.local_endpoint, args.partitions) if need_s3 else True
+
+    if (not need_local or local_ready) and s3_ready:
+        return local_graph if need_local else None
+
+    command = [
+        sys.executable,
+        os.path.join(HERE, "setup_large_uf_data.py"),
+        "--nodes", str(num_nodes),
+        "--partitions", str(args.partitions),
+        "--bucket", args.bucket,
+        "--endpoint", args.local_endpoint,
+        "--output", local_graph,
+        "--format", args.input_format,
+    ]
+    if not need_local:
+        command.append("--no-local")
+    if not need_s3:
+        command.append("--no-s3")
+
+    print("\nPreparing Union-Find input data...")
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=900)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Failed to generate Union-Find input data.\n"
+            f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+        )
+
+    local_ready = os.path.exists(local_graph) and os.path.getsize(local_graph) > 0
+    s3_ready = s3_partitions_available(args.bucket, key, args.local_endpoint, args.partitions) if need_s3 else True
+    if need_local and not local_ready:
+        raise RuntimeError(f"Union-Find local graph was not generated correctly: {local_graph}")
+    if need_s3 and not s3_ready:
+        raise RuntimeError(f"Union-Find S3 partitions are still missing under s3://{args.bucket}/{key}/")
+    return local_graph if need_local else None
+
+
 def run_standalone(graph_file: str, num_nodes: int, ufst_binary: str) -> Dict:
     """Run standalone Union-Find and return results."""
     result = subprocess.run(
@@ -111,6 +179,11 @@ def run_standalone(graph_file: str, num_nodes: int, ufst_binary: str) -> Dict:
 
 def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, float, Dict, str | None]:
     """Run burst Union-Find and return (num_components, algo_time_s, total_time_s, timing_details, component_hash)."""
+    if args.backend == "s3":
+        raise ValueError(
+            "The deployed Union-Find action does not support the S3 middleware backend. "
+            "Use --backend redis-list for the comparable graph campaign."
+        )
     granularity = args.granularity if args.granularity else 1
     params = generate_payload(
         endpoint=args.uf_endpoint,
@@ -128,7 +201,7 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
     host_submit = get_millis()
     dt = executor.burst("unionfind",
                         params,
-                        file="./unionfind.zip",
+                        file=os.path.join(HERE, "unionfind.zip"),
                         memory=args.runtime_memory if args.runtime_memory else 2048,
                         custom_image=args.custom_image,
                         debug_mode=args.debug,
@@ -202,14 +275,25 @@ def build_benchmark_summary(result: Dict) -> Dict:
     standalone_exec_ms = standalone.get("execution_time_ms")
     standalone_total_ms = standalone.get("total_time_ms", standalone_exec_ms)
     burst_algo_ms = burst.get("processing_time_ms", burst.get("time_ms"))
-    burst_total_ms = burst.get("total_time_ms", burst.get("time_ms"))
+    burst_warm_total_ms = burst.get("total_time_ms", burst.get("time_ms"))
+    burst_host_total_ms = burst.get("host_total_time_ms")
+    if burst_host_total_ms is None:
+        burst_host_total_ms = burst.get("timing_details", {}).get("total_ms")
 
     algo_speedup = None
-    total_speedup = None
+    warm_speedup = None
+    cold_speedup = None
     if standalone_exec_ms not in (None, 0) and burst_algo_ms not in (None, 0):
         algo_speedup = standalone_exec_ms / burst_algo_ms
-    if standalone_total_ms not in (None, 0) and burst_total_ms not in (None, 0):
-        total_speedup = standalone_total_ms / burst_total_ms
+    if standalone_total_ms not in (None, 0) and burst_warm_total_ms not in (None, 0):
+        warm_speedup = standalone_total_ms / burst_warm_total_ms
+    if standalone_total_ms not in (None, 0) and burst_host_total_ms not in (None, 0):
+        cold_speedup = standalone_total_ms / burst_host_total_ms
+
+    winner_span = "Burst" if algo_speedup is not None and algo_speedup > 1.0 else "Standalone" if algo_speedup is not None else None
+    winner_warm = "Burst" if warm_speedup is not None and warm_speedup > 1.0 else "Standalone" if warm_speedup is not None else None
+    winner_total = "Burst" if cold_speedup is not None and cold_speedup > 1.0 else "Standalone" if cold_speedup is not None else None
+    primary_metric = "total" if cold_speedup is not None else ("warm" if warm_speedup is not None else "span")
 
     return {
         "algorithm": "unionfind",
@@ -228,20 +312,31 @@ def build_benchmark_summary(result: Dict) -> Dict:
         },
         "burst": {
             "processing_time_ms": burst_algo_ms,
-            "total_time_ms": burst_total_ms,
+            "total_time_ms": burst_warm_total_ms,
+            "host_total_time_ms": burst_host_total_ms,
             "num_components": burst.get("num_components"),
             "component_hash": burst.get("component_hash"),
             "timing_details": burst.get("timing_details"),
         },
         "speedup": {
             "algorithmic": algo_speedup,
-            "overall": total_speedup,
+            "warm_total": warm_speedup,
+            "cold_total": cold_speedup,
+            "overall": cold_speedup if cold_speedup is not None else warm_speedup,
+        },
+        "winner": {
+            "span": winner_span,
+            "warm": winner_warm,
+            "total": winner_total,
+            "primary_metric": primary_metric,
+            "primary": winner_total if winner_total is not None else winner_warm if winner_warm is not None else winner_span,
         },
         "validation": {
             "requested": "standalone" in result and "burst" in result,
             "performed": "validation" in result,
             "passed": result.get("validation") == "PASSED",
             "skipped_reason": None if "validation" in result else "validation not available",
+            "mode": "exact_hash" if "validation" in result else None,
         },
     }
 
@@ -268,7 +363,7 @@ def main():
     # Benchmark specific
     parser.add_argument("--sizes", type=str, default="5000,10000,50000,100000",
                         help="Comma-separated list of node counts to benchmark")
-    parser.add_argument("--ufst-binary", type=str, default="./ufst/target/release/union-find",
+    parser.add_argument("--ufst-binary", type=str, default=os.path.join(HERE, "ufst/target/release/union-find"),
                         help="Path to standalone Union-Find binary")
     parser.add_argument("--graph-file", type=str, default=None,
                         help="Local graph file for standalone (skip S3 download). "
@@ -299,11 +394,12 @@ def main():
             "nodes": num_nodes,
             "partitions": args.partitions,
         }
+        prepared_graph = ensure_input_data(args, num_nodes, key)
         
         # Use local file or download from S3 for standalone
         if not args.skip_standalone:
-            if args.graph_file and os.path.exists(args.graph_file):
-                temp_graph = args.graph_file
+            if prepared_graph and os.path.exists(prepared_graph):
+                temp_graph = prepared_graph
                 delete_after = False
                 print(f"\nUsing local graph file: {temp_graph}")
             else:

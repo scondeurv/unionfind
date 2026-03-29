@@ -13,15 +13,28 @@ import sys
 import time
 from datetime import datetime
 
-TEST_POINTS = [
+
+def env_test_points(default: list[int]) -> list[int]:
+    raw = os.environ.get("TFM_TEST_POINTS", "").strip()
+    if not raw:
+        return default
+    return [int(token.strip()) for token in raw.split(",") if token.strip()]
+
+
+def env_runs(default: int) -> int:
+    raw = os.environ.get("TFM_RUNS", "").strip()
+    return int(raw) if raw else default
+
+
+TEST_POINTS = env_test_points([
     100_000,
     500_000,
     1_000_000,
     2_000_000,
     3_000_000,
     5_000_000,
-]
-RUNS = 5
+])
+RUNS = env_runs(5)
 
 PARTITIONS = 4
 MEMORY = 2048
@@ -40,6 +53,12 @@ def log(message):
     """Print with timestamp."""
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {message}", flush=True)
+
+
+def winner_for(speedup):
+    if speedup is None:
+        return None
+    return "Burst" if speedup > 1.0 else "Standalone"
 
 
 def crossing_intervals(results, x_key):
@@ -70,11 +89,12 @@ def estimate_crossover(results, x_key):
 def save_checkpoint(results):
     if not results:
         return
+    ordered_results = sorted(results, key=lambda entry: entry["nodes"])
     output_data = {
         'timestamp': datetime.now().isoformat(),
         'test_points': TEST_POINTS,
         'runs_per_point': RUNS,
-        'results': results,
+        'results': ordered_results,
         'crossover_estimate': None,
         'crossing_intervals': [],
         'crossover_warning': None,
@@ -104,6 +124,14 @@ def load_checkpoint():
     except Exception as exc:
         log(f"⚠️  Could not load checkpoint, ignoring partial file: {exc}")
         return []
+
+
+def completed_run_count(entry):
+    if not entry:
+        return 0
+    standalone_runs = len(entry.get("standalone_runs_ms", []))
+    burst_runs = len(entry.get("burst_runs_ms", []))
+    return min(standalone_runs, burst_runs)
 
 
 def generate_graph(nodes):
@@ -196,22 +224,28 @@ def run_benchmark(nodes, skip_generate=False):
     standalone_time = benchmark_summary.get("standalone", {}).get("total_time_ms")
     burst_span = benchmark_summary.get("burst", {}).get("processing_time_ms")
     burst_time = benchmark_summary.get("burst", {}).get("total_time_ms")
-    burst_host_total = benchmark_summary.get("burst", {}).get("timing_details", {}).get("total_ms")
+    burst_host_total = benchmark_summary.get("burst", {}).get("host_total_time_ms")
+    if burst_host_total is None:
+        burst_host_total = benchmark_summary.get("burst", {}).get("timing_details", {}).get("total_ms")
 
     if standalone_exec and standalone_time and burst_time:
         speedup_span = standalone_exec / burst_span if burst_span not in (None, 0) else None
         speedup = standalone_time / burst_time
+        speedup_total = standalone_time / burst_host_total if burst_host_total not in (None, 0) else None
+        winner_span = winner_for(speedup_span)
+        winner_warm = winner_for(speedup)
+        winner_total = winner_for(speedup_total)
+        winner_primary = winner_total if winner_total is not None else winner_warm if winner_warm is not None else winner_span
         log(f"\n📊 Results for {nodes/1e6:.1f}M nodes:")
         log(f"   Standalone (load + exec): {standalone_time:.2f} ms")
         log(f"   Burst warm total:         {burst_time:.2f} ms")
         if burst_span is not None:
             log(f"   Burst span:               {burst_span:.2f} ms")
+        if speedup_total is not None:
+            log(f"   Speedup (cold): {speedup_total:.2f}x  →  {winner_total} ✅")
         log(f"   Speedup (warm): {speedup:.2f}x")
         if speedup_span is not None:
             log(f"   Speedup (span): {speedup_span:.2f}x")
-
-        winner = "Burst" if speedup > 1.0 else "Standalone"
-        log(f"   Winner:     {winner} ✅")
 
         return {
             'nodes': nodes,
@@ -223,10 +257,15 @@ def run_benchmark(nodes, skip_generate=False):
             'burst_warm_ms': burst_time,
             'burst_span_ms': burst_span,
             'speedup': speedup_span,
-            'speedup_total': benchmark_summary.get("standalone", {}).get("total_time_ms") / burst_host_total if burst_host_total not in (None, 0) else None,
+            'speedup_total': speedup_total,
             'speedup_warm': speedup,
             'speedup_span': speedup_span,
-            'winner': winner,
+            'winner_span': winner_span,
+            'winner_warm': winner_warm,
+            'winner_total': winner_total,
+            'winner_primary': winner_primary,
+            'primary_metric': 'total' if winner_total is not None else 'warm',
+            'winner': winner_primary,
             'validation': benchmark_summary.get("validation", {}),
         }
 
@@ -248,24 +287,39 @@ def main():
     log("=" * 80)
 
     results = load_checkpoint()
-    completed_nodes = {entry["nodes"] for entry in results}
+    results_by_node = {entry["nodes"]: entry for entry in results}
+    completed_nodes = {
+        nodes for nodes, entry in results_by_node.items()
+        if completed_run_count(entry) >= RUNS
+    }
     if completed_nodes:
         log(f"♻️  Resuming from checkpoint: completed nodes = {sorted(completed_nodes)}")
 
     for nodes in TEST_POINTS:
+        existing_entry = results_by_node.get(nodes)
+        existing_runs = completed_run_count(existing_entry)
         if nodes in completed_nodes:
             log(f"⏭️  Skipping {nodes/1e6:.1f}M nodes (already checkpointed)")
             continue
-        sa_exec_times = []
-        bs_span_times = []
-        sa_total_times = []
-        bs_warm_times = []
-        bs_total_times = []
-        validation_state = None
+        if existing_runs:
+            log(f"♻️  Resuming incomplete point {nodes/1e6:.1f}M with {existing_runs}/{RUNS} runs already saved")
 
-        for run_idx in range(RUNS):
+        sa_exec_times = list(existing_entry.get("standalone_runs_ms", [])) if existing_entry else []
+        bs_span_times = list(existing_entry.get("burst_runs_ms", [])) if existing_entry else []
+        sa_total_times = list(existing_entry.get("standalone_total_runs_ms", [])) if existing_entry else []
+        if existing_entry and not sa_total_times and existing_entry.get("standalone_total_ms") is not None and sa_exec_times:
+            sa_total_times.extend([existing_entry["standalone_total_ms"]] * existing_runs)
+        bs_warm_times = list(existing_entry.get("burst_warm_runs_ms", [])) if existing_entry else []
+        if existing_entry and not bs_warm_times and existing_entry.get("burst_warm_ms") is not None and bs_span_times:
+            bs_warm_times.extend([existing_entry["burst_warm_ms"]] * existing_runs)
+        bs_total_times = list(existing_entry.get("burst_total_runs_ms", [])) if existing_entry else []
+        if existing_entry and not bs_total_times and existing_entry.get("burst_total_ms") is not None and bs_span_times:
+            bs_total_times.extend([existing_entry["burst_total_ms"]] * existing_runs)
+        validation_state = existing_entry.get("validation") if existing_entry else None
+
+        for run_idx in range(existing_runs, RUNS):
             log(f"\n▶ Run {run_idx + 1}/{RUNS} — {nodes/1e6:.1f}M nodes")
-            result = run_benchmark(nodes, skip_generate=run_idx > 0)
+            result = run_benchmark(nodes, skip_generate=run_idx > 0 or existing_runs > 0)
             if result:
                 sa_exec_times.append(result["standalone_ms"])
                 bs_span_times.append(result["burst_ms"])
@@ -299,15 +353,21 @@ def main():
         speedup_total = None
         if sa_total_mean is not None and bs_total_mean not in (None, 0):
             speedup_total = sa_total_mean / bs_total_mean
-        winner = "Burst" if speedup_warm > 1.0 else "Standalone"
+        winner_span = winner_for(speedup)
+        winner_warm = winner_for(speedup_warm)
+        winner_total = winner_for(speedup_total)
+        winner_primary = winner_total if winner_total is not None else winner_warm if winner_warm is not None else winner_span
 
         log(f"\n📊 Aggregate {nodes/1e6:.1f}M ({len(sa_total_times)} runs):")
         log(f"   Standalone total: {sa_total_mean:.1f} ± {sa_total_std:.1f} ms  (runs: {[f'{v:.0f}' for v in sa_total_times]})")
         log(f"   Burst warm total: {bs_warm_mean:.1f} ± {bs_warm_std:.1f} ms  (runs: {[f'{v:.0f}' for v in bs_warm_times]})")
-        log(f"   Speedup (warm): {speedup_warm:.2f}x  →  {winner}")
+        if speedup_total is not None:
+            log(f"   Speedup (cold): {speedup_total:.2f}x  →  {winner_total}")
+        log(f"   Speedup (warm): {speedup_warm:.2f}x")
         log(f"   Span secondary: SA exec {sa_exec_mean:.1f} ± {sa_exec_std:.1f} ms vs Burst span {bs_span_mean:.1f} ± {bs_span_std:.1f} ms")
 
-        results.append({
+        results = [entry for entry in results if entry["nodes"] != nodes]
+        updated_entry = {
             "nodes": nodes,
             "standalone_ms": round(sa_exec_mean, 2),
             "standalone_exec_ms": round(sa_exec_mean, 2),
@@ -320,13 +380,23 @@ def main():
             "speedup": round(speedup, 4),
             "speedup_span": round(speedup, 4),
             "standalone_total_ms": round(sa_total_mean, 2) if sa_total_mean is not None else None,
+            "standalone_total_runs_ms": sa_total_times,
             "burst_total_ms": round(bs_total_mean, 2) if bs_total_mean is not None else None,
+            "burst_total_runs_ms": bs_total_times,
             "speedup_total": round(speedup_total, 4) if speedup_total is not None else None,
             "burst_warm_ms": round(bs_warm_mean, 2),
+            "burst_warm_runs_ms": bs_warm_times,
             "speedup_warm": round(speedup_warm, 4),
-            "winner": winner,
+            "winner_span": winner_span,
+            "winner_warm": winner_warm,
+            "winner_total": winner_total,
+            "winner_primary": winner_primary,
+            "primary_metric": "total" if winner_total is not None else "warm",
+            "winner": winner_primary,
             "validation": validation_state or {},
-        })
+        }
+        results.append(updated_entry)
+        results_by_node[nodes] = updated_entry
         save_checkpoint(results)
 
         time.sleep(5)
@@ -338,6 +408,7 @@ def main():
     log(f"{'Nodes':>12} {'SA mean':>12} {'SA std':>9} {'BS mean':>12} {'BS std':>9} {'Speedup':>10} {'Winner':>12}")
     log("-" * 80)
 
+    results = sorted(results, key=lambda entry: entry["nodes"])
     crossover_point, intervals = estimate_crossover(results, "nodes")
 
     for i, r in enumerate(results):
