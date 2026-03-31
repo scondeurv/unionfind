@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Generate large Union-Find graph datasets for benchmarking.
-Creates both local .tsv file for standalone version and S3 partitions for burst version.
+Generate large WCC graph datasets for benchmarking.
+Creates both local .tsv files for standalone and S3 partitions for burst.
 
 Graph structure: N nodes divided into C connected components. Each component has
 a spanning tree for guaranteed connectivity plus random intra-component edges
@@ -134,7 +134,7 @@ def partition_and_upload_s3(edges, num_nodes, num_partitions, bucket, key, endpo
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate large UF graph datasets (local + S3)")
+        description="Generate large WCC graph datasets (local + S3)")
     parser.add_argument("--nodes", type=int, required=True, help="Number of nodes")
     parser.add_argument("--edges-per-node", type=int, default=5,
                         help="Edges per node (density, default: 5)")
@@ -143,11 +143,11 @@ def main():
     parser.add_argument("--partitions", type=int, default=4,
                         help="Number of S3 partitions (default: 4)")
     parser.add_argument("--output", type=str, default=None,
-                        help="Local output file (default: uf_graph_{nodes}.tsv)")
+                        help="Local output file (default: wcc_graph_{nodes}.tsv)")
     parser.add_argument("--bucket", type=str, default="test-bucket",
                         help="S3 bucket name")
     parser.add_argument("--key", type=str, default=None,
-                        help="S3 key prefix (default: uf-graphs/uf-{nodes})")
+                        help="S3 key prefix (default: wcc-graphs/wcc-{nodes})")
     parser.add_argument("--endpoint", type=str, default="http://localhost:9000",
                         help="S3 endpoint URL")
     parser.add_argument("--no-s3", action="store_true",
@@ -164,14 +164,14 @@ def main():
     args = parser.parse_args()
 
     if args.output is None:
-        args.output = f"uf_graph_{args.nodes}.tsv"
+        args.output = f"wcc_graph_{args.nodes}.tsv"
     if args.key is None:
-        args.key = f"uf-graphs/uf-{args.nodes}"
+        args.key = f"wcc-graphs/wcc-{args.nodes}"
 
     access_key = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
     secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
 
-    print(f"=== Union-Find Graph Generator ===")
+    print(f"=== WCC Graph Generator ===")
     print(f"Nodes:      {args.nodes:,}")
     print(f"Density:    {args.edges_per_node} edges/node")
     print(f"Components: {args.components}")

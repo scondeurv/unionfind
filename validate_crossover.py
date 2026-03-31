@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Validate Union-Find on the common graph-size grid used in the TFM.
+Validate connected components on the common graph-size grid used in the TFM.
 
 Runs the same size progression as the other comparable graph algorithms so the
 experimental section can discuss them on a homogeneous scale up to 5M nodes.
@@ -46,7 +46,13 @@ COMPONENTS = 10
 PYTHON_CMD = os.environ.get("VALIDATION_PYTHON", sys.executable)
 FLUSH_CMD = os.environ.get("UF_FLUSH_CMD", "kubectl exec pod/dragonfly -- redis-cli FLUSHALL")
 BENCHMARK_JSON_PREFIX = "BENCHMARK_RESULT_JSON:"
-OUTPUT_FILE = "uf_crossover_validation_results.json"
+BENCHMARK_TITLE = os.environ.get("WCC_BENCHMARK_TITLE", "WCC")
+OUTPUT_FILE = os.environ.get("WCC_OUTPUT_FILE", "wcc_crossover_validation_results.json")
+INTERMEDIATE_PREFIX = os.environ.get("WCC_INTERMEDIATE_PREFIX", "wcc_crossover")
+GRAPH_FILE_PREFIX = os.environ.get("WCC_GRAPH_FILE_PREFIX", "wcc_graph")
+DATASET_KEY_PREFIX = os.environ.get("WCC_DATASET_KEY_PREFIX", "wcc-graphs/wcc")
+OW_HOST = os.environ.get("OW_HOST", "localhost")
+OW_PORT = os.environ.get("OW_PORT", "31001")
 
 
 def log(message):
@@ -137,6 +143,8 @@ def completed_run_count(entry):
 def generate_graph(nodes):
     """Generate graph data (local file + S3)."""
     log(f"Generating {nodes/1e6:.1f}M node graph...")
+    graph_file = f"{GRAPH_FILE_PREFIX}_{nodes}.tsv"
+    graph_key = f"{DATASET_KEY_PREFIX}-{nodes}"
 
     result = subprocess.run([
         PYTHON_CMD, "setup_large_uf_data.py",
@@ -144,6 +152,8 @@ def generate_graph(nodes):
         "--partitions", str(PARTITIONS),
         "--bucket", BUCKET,
         "--endpoint", LOCAL_ENDPOINT,
+        "--output", graph_file,
+        "--key", graph_key,
         "--edges-per-node", str(EDGES_PER_NODE),
         "--components", str(COMPONENTS),
     ], capture_output=True, text=True, timeout=600)
@@ -166,7 +176,7 @@ def run_benchmark(nodes, skip_generate=False):
     if not skip_generate and not generate_graph(nodes):
         return None
 
-    graph_file = f"uf_graph_{nodes}.tsv"
+    graph_file = f"{GRAPH_FILE_PREFIX}_{nodes}.tsv"
 
     # Flush Redis/Dragonfly for clean state
     if FLUSH_CMD:
@@ -177,8 +187,8 @@ def run_benchmark(nodes, skip_generate=False):
     # We use a piped process to stream output in real-time
     process = subprocess.Popen([
         PYTHON_CMD, "benchmark_uf.py",
-        "--ow-host", "localhost",
-        "--ow-port", "31001",
+        "--ow-host", OW_HOST,
+        "--ow-port", OW_PORT,
         "--uf-endpoint", S3_ENDPOINT,
         "--local-endpoint", LOCAL_ENDPOINT,
         "--partitions", str(PARTITIONS),
@@ -188,7 +198,7 @@ def run_benchmark(nodes, skip_generate=False):
         "--backend", "redis-list",
         "--chunk-size", "262144",
         "--graph-file", graph_file,
-        "--output", f"uf_crossover_{nodes}.json",
+        "--output", f"{INTERMEDIATE_PREFIX}_{nodes}.json",
     ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     output = []
@@ -276,13 +286,14 @@ def run_benchmark(nodes, skip_generate=False):
 def main():
     """Run crossover validation."""
     log("=" * 80)
-    log("UNION-FIND CROSSOVER VALIDATION BENCHMARK")
+    log(f"{BENCHMARK_TITLE.upper()} CROSSOVER VALIDATION BENCHMARK")
     log("=" * 80)
     log(f"Testing {len(TEST_POINTS)} strategic points")
     log(f"Test points: {[f'{n/1e6:.1f}M' for n in TEST_POINTS]}")
     log(f"Runs per point: {RUNS}")
     log(f"Config: partitions={PARTITIONS}, memory={MEMORY}MB, "
         f"edges/node={EDGES_PER_NODE}, components={COMPONENTS}")
+    log(f"OpenWhisk endpoint: {OW_HOST}:{OW_PORT}")
     log(f"Python runner: {PYTHON_CMD}")
     log("=" * 80)
 

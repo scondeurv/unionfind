@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Benchmark Union-Find: Burst vs Standalone comparison.
+Benchmark WCC: Burst vs Standalone comparison.
 
-This script runs both burst (distributed) and standalone (local) Union-Find
+This script runs both burst (distributed) and standalone (local) WCC
 and compares the results for validation.
 """
 
@@ -25,10 +25,33 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ow_client.parser import add_openwhisk_to_parser, add_burst_to_parser, try_or_except
 from ow_client.time_helper import get_millis
 from ow_client.openwhisk_executor import OpenwhiskExecutor
-from unionfind_utils import generate_payload, add_unionfind_to_parser
+from unionfind_utils import generate_payload
 
 BENCHMARK_JSON_PREFIX = "BENCHMARK_RESULT_JSON:"
 HERE = os.path.dirname(os.path.abspath(__file__))
+BENCHMARK_NAME = os.environ.get("WCC_BENCHMARK_TITLE", "WCC")
+BENCHMARK_SLUG = os.environ.get("WCC_ALGORITHM_SLUG", "wcc")
+ACTION_NAME = os.environ.get("WCC_ACTION_NAME", "wcc")
+GRAPH_FILE_PREFIX = os.environ.get("WCC_GRAPH_FILE_PREFIX", "wcc_graph")
+DATASET_PREFIX = os.environ.get("WCC_DATASET_PREFIX", "wcc-graphs")
+DATASET_BASENAME = os.environ.get("WCC_DATASET_BASENAME", "wcc")
+ZIP_FILE = os.environ.get("WCC_ZIP_FILE", os.path.join(HERE, "unionfind.zip"))
+CLEAN_BURST_CLUSTER_SCRIPT = os.path.join(os.path.dirname(HERE), "clean_burst_cluster.sh")
+
+
+def clean_burst_cluster() -> None:
+    result = subprocess.run(
+        ["bash", CLEAN_BURST_CLUSTER_SCRIPT],
+        cwd=os.path.dirname(HERE),
+        text=True,
+        capture_output=True,
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.returncode != 0:
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+        raise RuntimeError("failed to clean Burst cluster before running wcc")
 
 
 def canonical_component_hash(parent: List[int]) -> str:
@@ -114,7 +137,7 @@ def s3_partitions_available(bucket: str, key: str, endpoint: str, num_partitions
 
 def ensure_input_data(args, num_nodes: int, key: str) -> str | None:
     """Ensure the local graph and S3 partitions required by the benchmark exist."""
-    local_graph = args.graph_file or f"uf_graph_{num_nodes}.tsv"
+    local_graph = args.graph_file or f"{GRAPH_FILE_PREFIX}_{num_nodes}.tsv"
     need_local = not args.skip_standalone
     need_s3 = not args.skip_burst
     local_ready = os.path.exists(local_graph) and os.path.getsize(local_graph) > 0
@@ -138,27 +161,27 @@ def ensure_input_data(args, num_nodes: int, key: str) -> str | None:
     if not need_s3:
         command.append("--no-s3")
 
-    print("\nPreparing Union-Find input data...")
+    print(f"\nPreparing {BENCHMARK_NAME} input data...")
     completed = subprocess.run(command, capture_output=True, text=True, timeout=900)
     if completed.returncode != 0:
         raise RuntimeError(
-            "Failed to generate Union-Find input data.\n"
+            f"Failed to generate {BENCHMARK_NAME} input data.\n"
             f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
         )
 
     local_ready = os.path.exists(local_graph) and os.path.getsize(local_graph) > 0
     s3_ready = s3_partitions_available(args.bucket, key, args.local_endpoint, args.partitions) if need_s3 else True
     if need_local and not local_ready:
-        raise RuntimeError(f"Union-Find local graph was not generated correctly: {local_graph}")
+        raise RuntimeError(f"{BENCHMARK_NAME} local graph was not generated correctly: {local_graph}")
     if need_s3 and not s3_ready:
-        raise RuntimeError(f"Union-Find S3 partitions are still missing under s3://{args.bucket}/{key}/")
+        raise RuntimeError(f"{BENCHMARK_NAME} S3 partitions are still missing under s3://{args.bucket}/{key}/")
     return local_graph if need_local else None
 
 
-def run_standalone(graph_file: str, num_nodes: int, ufst_binary: str) -> Dict:
-    """Run standalone Union-Find and return results."""
+def run_standalone(graph_file: str, num_nodes: int, standalone_binary: str) -> Dict:
+    """Run standalone WCC and return results."""
     result = subprocess.run(
-        [ufst_binary, graph_file, str(num_nodes)],
+        [standalone_binary, graph_file, str(num_nodes)],
         capture_output=True,
         text=True
     )
@@ -178,15 +201,15 @@ def run_standalone(graph_file: str, num_nodes: int, ufst_binary: str) -> Dict:
 
 
 def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, float, Dict, str | None]:
-    """Run burst Union-Find and return (num_components, algo_time_s, total_time_s, timing_details, component_hash)."""
+    """Run burst WCC and return (num_components, algo_time_s, total_time_s, timing_details, component_hash)."""
     if args.backend == "s3":
         raise ValueError(
-            "The deployed Union-Find action does not support the S3 middleware backend. "
+            "The deployed WCC action does not support the S3 middleware backend. "
             "Use --backend redis-list for the comparable graph campaign."
         )
     granularity = args.granularity if args.granularity else 1
     params = generate_payload(
-        endpoint=args.uf_endpoint,
+        endpoint=args.wcc_endpoint,
         partitions=args.partitions,
         num_nodes=num_nodes,
         bucket=bucket,
@@ -199,9 +222,9 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
     executor = OpenwhiskExecutor(args.ow_host, args.ow_port, args.debug)
     
     host_submit = get_millis()
-    dt = executor.burst("unionfind",
+    dt = executor.burst(ACTION_NAME,
                         params,
-                        file=os.path.join(HERE, "unionfind.zip"),
+                        file=ZIP_FILE,
                         memory=args.runtime_memory if args.runtime_memory else 2048,
                         custom_image=args.custom_image,
                         debug_mode=args.debug,
@@ -296,10 +319,10 @@ def build_benchmark_summary(result: Dict) -> Dict:
     primary_metric = "total" if cold_speedup is not None else ("warm" if warm_speedup is not None else "span")
 
     return {
-        "algorithm": "unionfind",
+        "algorithm": BENCHMARK_SLUG,
         "dataset": {
             "nodes": result.get("nodes"),
-            "s3_prefix": f"uf-graphs/uf-{result.get('nodes')}",
+            "s3_prefix": result.get("s3_prefix"),
         },
         "configuration": {
             "partitions": result.get("partitions"),
@@ -342,12 +365,12 @@ def build_benchmark_summary(result: Dict) -> Dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark Union-Find: Burst vs Standalone")
+    parser = argparse.ArgumentParser(description="Benchmark WCC: Burst vs Standalone")
     add_openwhisk_to_parser(parser)
     add_burst_to_parser(parser)
     
     # UF-specific arguments
-    parser.add_argument("--uf-endpoint", type=str, required=True,
+    parser.add_argument("--wcc-endpoint", "--uf-endpoint", dest="wcc_endpoint", type=str, required=True,
                         help="Endpoint of the S3 service (for workers)")
     parser.add_argument("--local-endpoint", type=str, default="http://localhost:9000",
                         help="Local S3 endpoint (for downloading)")
@@ -363,8 +386,9 @@ def main():
     # Benchmark specific
     parser.add_argument("--sizes", type=str, default="5000,10000,50000,100000",
                         help="Comma-separated list of node counts to benchmark")
-    parser.add_argument("--ufst-binary", type=str, default=os.path.join(HERE, "ufst/target/release/union-find"),
-                        help="Path to standalone Union-Find binary")
+    parser.add_argument("--wcc-binary", "--ufst-binary", dest="wcc_binary", type=str,
+                        default=os.path.join(HERE, "ufst/target/release/union-find"),
+                        help="Path to standalone WCC binary")
     parser.add_argument("--graph-file", type=str, default=None,
                         help="Local graph file for standalone (skip S3 download). "
                              "If not set, downloads from S3.")
@@ -372,7 +396,7 @@ def main():
                         help="Skip standalone execution")
     parser.add_argument("--skip-burst", action="store_true",
                         help="Skip burst execution")
-    parser.add_argument("--output", type=str, default="uf_benchmark_results.json",
+    parser.add_argument("--output", type=str, default="wcc_benchmark_results.json",
                         help="Output file for results")
     
     args = try_or_except(parser)
@@ -381,11 +405,11 @@ def main():
     results = []
     
     print("=" * 60)
-    print("Union-Find Benchmark: Burst vs Standalone")
+    print(f"{BENCHMARK_NAME} Benchmark: Burst vs Standalone")
     print("=" * 60)
     
     for num_nodes in sizes:
-        key = f"uf-graphs/uf-{num_nodes}"
+        key = f"{DATASET_PREFIX}/{DATASET_BASENAME}-{num_nodes}"
         print(f"\n{'='*60}")
         print(f"Testing with {num_nodes:,} nodes")
         print(f"{'='*60}")
@@ -393,6 +417,7 @@ def main():
         result = {
             "nodes": num_nodes,
             "partitions": args.partitions,
+            "s3_prefix": key,
         }
         prepared_graph = ensure_input_data(args, num_nodes, key)
         
@@ -416,8 +441,8 @@ def main():
                 result["edges"] = num_edges
             
             # Run standalone
-            print(f"\nRunning standalone Union-Find...")
-            standalone_result = run_standalone(temp_graph, num_nodes, args.ufst_binary)
+            print(f"\nRunning standalone {BENCHMARK_NAME}...")
+            standalone_result = run_standalone(temp_graph, num_nodes, args.wcc_binary)
             
             if standalone_result:
                 result["standalone"] = {
@@ -439,7 +464,8 @@ def main():
         
         # Run burst
         if not args.skip_burst:
-            print(f"\nRunning burst Union-Find ({args.partitions} workers)...")
+            clean_burst_cluster()
+            print(f"\nRunning burst {BENCHMARK_NAME} ({args.partitions} workers)...")
             try:
                 burst_components, burst_time, burst_total_time, timing, burst_hash = run_burst(args, num_nodes, args.bucket, key)
                 burst_time_ms = burst_time * 1000
