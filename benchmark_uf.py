@@ -21,10 +21,14 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+LP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "labelpropagation")
+if LP_DIR not in sys.path:
+    sys.path.append(LP_DIR)
 
 from ow_client.parser import add_openwhisk_to_parser, add_burst_to_parser, try_or_except
 from ow_client.time_helper import get_millis
 from ow_client.openwhisk_executor import OpenwhiskExecutor
+from runtime_metrics import estimate_logical_traffic_bytes, estimate_wcc_phase_metrics
 from unionfind_utils import generate_payload
 
 BENCHMARK_JSON_PREFIX = "BENCHMARK_RESULT_JSON:"
@@ -295,6 +299,8 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
 def build_benchmark_summary(result: Dict) -> Dict:
     standalone = result.get("standalone", {})
     burst = result.get("burst", {})
+    partitions = result.get("partitions")
+    granularity = result.get("granularity") or 1
     standalone_exec_ms = standalone.get("execution_time_ms")
     standalone_total_ms = standalone.get("total_time_ms", standalone_exec_ms)
     burst_algo_ms = burst.get("processing_time_ms", burst.get("time_ms"))
@@ -302,6 +308,20 @@ def build_benchmark_summary(result: Dict) -> Dict:
     burst_host_total_ms = burst.get("host_total_time_ms")
     if burst_host_total_ms is None:
         burst_host_total_ms = burst.get("timing_details", {}).get("total_ms")
+    workers = 0
+    if partitions:
+        workers = int(partitions) // int(granularity) if granularity else int(partitions)
+    phase_metrics = estimate_wcc_phase_metrics(
+        burst.get("timing_details"),
+        workers=max(1, workers),
+        host_total_ms=int(burst_host_total_ms) if burst_host_total_ms is not None else None,
+    )
+    traffic = estimate_logical_traffic_bytes(
+        algorithm="wcc",
+        num_nodes=int(result.get("nodes") or 0),
+        workers=max(1, workers),
+        iterations=(phase_metrics or {}).get("iterations", 0) or 0,
+    )
 
     algo_speedup = None
     warm_speedup = None
@@ -325,7 +345,11 @@ def build_benchmark_summary(result: Dict) -> Dict:
             "s3_prefix": result.get("s3_prefix"),
         },
         "configuration": {
-            "partitions": result.get("partitions"),
+            "partitions": partitions,
+            "granularity": granularity,
+            "memory_mb": result.get("memory_mb"),
+            "backend": result.get("backend"),
+            "chunk_size": result.get("chunk_size"),
         },
         "standalone": {
             "execution_time_ms": standalone_exec_ms,
@@ -340,6 +364,8 @@ def build_benchmark_summary(result: Dict) -> Dict:
             "num_components": burst.get("num_components"),
             "component_hash": burst.get("component_hash"),
             "timing_details": burst.get("timing_details"),
+            "phase_metrics": phase_metrics,
+            "logical_traffic_bytes": traffic,
         },
         "speedup": {
             "algorithmic": algo_speedup,
@@ -417,6 +443,10 @@ def main():
         result = {
             "nodes": num_nodes,
             "partitions": args.partitions,
+            "granularity": args.granularity if args.granularity else 1,
+            "memory_mb": args.runtime_memory if args.runtime_memory else 2048,
+            "backend": args.backend,
+            "chunk_size": args.chunk_size,
             "s3_prefix": key,
         }
         prepared_graph = ensure_input_data(args, num_nodes, key)
