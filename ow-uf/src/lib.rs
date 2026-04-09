@@ -245,16 +245,16 @@ fn parse_tsv_edges_into_uf(
     parsed
 }
 
-async fn process_partitions_into_uf(
+/// Download all assigned partitions from S3 and return raw byte buffers.
+/// This separates the S3 load phase from the UF computation phase so each
+/// can be timed independently.
+async fn download_partitions(
     params: &Input,
     s3_client: &S3Client,
     worker_id: u32,
-    parent: &mut [u32],
-    rank: &mut [u8],
-    seen: &mut [bool],
-) -> usize {
-    let start_part = worker_id * params.granularity;
-    let end_part = (worker_id + 1) * params.granularity;
+) -> Vec<Vec<u8>> {
+    let start_part = worker_id;
+    let end_part = worker_id + 1;
 
     let mut fetch_futures = Vec::new();
     for p in start_part..end_part {
@@ -270,49 +270,45 @@ async fn process_partitions_into_uf(
     }
 
     let results = join_all(fetch_futures).await;
-    let mut parsed_edges = 0usize;
-    let preferred_format = params.input_data.format.as_deref();
+    let mut buffers: Vec<Vec<u8>> = Vec::new();
 
     for (p, result) in results {
         match result {
             Ok(output) => {
                 match output.body.collect().await {
-                    Ok(data) => {
-                        let bytes = data.to_vec();
-                        let use_binary = match preferred_format {
-                            Some("binary") => true,
-                            Some("tsv") | Some("text") => false,
-                            _ => bytes.len() % 8 == 0 && !looks_like_tsv(&bytes),
-                        };
-
-                        let parsed_in_partition = if use_binary {
-                            parse_binary_edges_into_uf(
-                                &bytes,
-                                params.num_nodes,
-                                parent,
-                                rank,
-                                seen,
-                            )
-                        } else {
-                            parse_tsv_edges_into_uf(
-                                &bytes,
-                                params.num_nodes,
-                                parent,
-                                rank,
-                                seen,
-                            )
-                        };
-
-                        parsed_edges += parsed_in_partition;
-                    }
+                    Ok(data) => buffers.push(data.to_vec()),
                     Err(e) => eprintln!("[Worker {}] Error collecting body for partition {}: {}", worker_id, p, e),
                 }
             }
             Err(e) => eprintln!("[Worker {}] S3 error fetching partition {}: {}", worker_id, p, e),
         }
     }
+    buffers
+}
 
-    println!("[Worker {}] Loaded/processed {} edges", worker_id, parsed_edges);
+/// Process pre-downloaded byte buffers into Union-Find state.
+fn process_buffers_into_uf(
+    buffers: &[Vec<u8>],
+    preferred_format: Option<&str>,
+    num_nodes: u32,
+    parent: &mut [u32],
+    rank: &mut [u8],
+    seen: &mut [bool],
+) -> usize {
+    let mut parsed_edges = 0usize;
+    for bytes in buffers {
+        let use_binary = match preferred_format {
+            Some("binary") => true,
+            Some("tsv") | Some("text") => false,
+            _ => bytes.len() % 8 == 0 && !looks_like_tsv(bytes),
+        };
+        let parsed_in_partition = if use_binary {
+            parse_binary_edges_into_uf(bytes, num_nodes, parent, rank, seen)
+        } else {
+            parse_tsv_edges_into_uf(bytes, num_nodes, parent, rank, seen)
+        };
+        parsed_edges += parsed_in_partition;
+    }
     parsed_edges
 }
 
@@ -351,25 +347,26 @@ fn union_find_optimized(
     };
     let s3_client = S3Client::from_conf(config);
 
-    // Phase 1: Local UF with flat arrays (cache-friendly, no hashing)
-    // Process S3 payloads directly into UF state to avoid storing all edges.
+    // Phase 1a: Download S3 partitions into memory buffers (load phase).
     timestamps.push(timestamp("get_input"));
+    let buffers = rt.block_on(download_partitions(&params, &s3_client, worker));
+    timestamps.push(timestamp("get_input_end"));
+
+    // Phase 1b: Run local Union-Find on the buffered data (compute phase).
     timestamps.push(timestamp("local_uf_start"));
     let n = params.num_nodes as usize;
     let mut parent: Vec<u32> = (0..n as u32).collect();
     let mut rank: Vec<u8> = vec![0; n];
     let mut seen = vec![false; n];
 
-    let processed_edges = rt.block_on(process_partitions_into_uf(
-        &params,
-        &s3_client,
-        worker,
+    let processed_edges = process_buffers_into_uf(
+        &buffers,
+        params.input_data.format.as_deref(),
+        params.num_nodes,
         &mut parent,
         &mut rank,
         &mut seen,
-    ));
-
-    timestamps.push(timestamp("get_input_end"));
+    );
     timestamps.push(timestamp("local_uf_end"));
 
     let seen_count = seen.iter().filter(|&&v| v).count();
@@ -464,22 +461,39 @@ fn union_find_optimized(
         None
     };
 
-    // Final result reporting — ROOT_WORKER already computed everything during
-    // the global merge.  The broadcast step has been removed because it was
-    // sending an empty message (ParentMessage(vec![])) and the non-root
-    // workers were blocking on it indefinitely, causing 60-min timeouts.
-    let (num_components, component_hash, results_report) = if worker == ROOT_WORKER {
-        let mut report = String::new();
-        report.push_str("\n=== Optimized Union-Find Results ===\n");
-        report.push_str(&format!("Total nodes: {}\n", params.num_nodes));
-        let (num_comp, component_hash) = root_summary.clone().unwrap();
-        report.push_str(&format!("Connected components: {}\n", num_comp));
-        report.push_str(&format!("Component hash: {}\n", component_hash));
-        report.push_str("============================\n");
-
-        (Some(num_comp), Some(component_hash), Some(report))
+    // Broadcast result from ROOT_WORKER to all workers.
+    // Encoded as ParentMessage: [(u32::MAX, num_components), (hash_high, hash_low)]
+    // u32::MAX is a sentinel that distinguishes this from reduce data (node ids < u32::MAX).
+    timestamps.push(timestamp("broadcast_start"));
+    let broadcast_payload = if worker == ROOT_WORKER {
+        let (nc, ref hash_str) = root_summary.clone().unwrap();
+        let hash_val = u64::from_str_radix(hash_str, 16).unwrap_or(0);
+        let hash_high = (hash_val >> 32) as u32;
+        let hash_low = hash_val as u32;
+        Some(ParentMessage(vec![(u32::MAX, nc as u32), (hash_high, hash_low)]))
     } else {
-        (None, None, None)
+        None
+    };
+    let received = middleware.broadcast(broadcast_payload, ROOT_WORKER).unwrap();
+    timestamps.push(timestamp("broadcast_end"));
+
+    let (num_components, component_hash, results_report) = {
+        let pairs = &received.0;
+        let nc = pairs[0].1 as usize;
+        let hash_val = ((pairs[1].0 as u64) << 32) | (pairs[1].1 as u64);
+        let hash_str = format!("{:016x}", hash_val);
+        let report = if worker == ROOT_WORKER {
+            let mut r = String::new();
+            r.push_str("\n=== Optimized Union-Find Results ===\n");
+            r.push_str(&format!("Total nodes: {}\n", params.num_nodes));
+            r.push_str(&format!("Connected components: {}\n", nc));
+            r.push_str(&format!("Component hash: {}\n", hash_str));
+            r.push_str("============================\n");
+            Some(r)
+        } else {
+            None
+        };
+        (Some(nc), Some(hash_str), report)
     };
 
     timestamps.push(timestamp("worker_end"));

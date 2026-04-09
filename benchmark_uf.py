@@ -249,7 +249,9 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
     worker_ends = []
     algo_starts = []
     algo_ends = []
-    
+    load_starts = []
+    load_ends = []
+
     for sublist in dt_results:
         if isinstance(sublist, list):
             for item in sublist:
@@ -260,14 +262,20 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
                         component_hash = item['component_hash']
                     # Extract per-worker timestamps
                     for ts in item.get('timestamps', []):
-                        if ts['key'] == 'worker_start':
-                            worker_starts.append(int(ts['value']))
-                        elif ts['key'] == 'worker_end':
-                            worker_ends.append(int(ts['value']))
-                        elif ts['key'] == 'local_uf_start':
-                            algo_starts.append(int(ts['value']))
-                        elif ts['key'] == 'global_merge_end':
-                            algo_ends.append(int(ts['value']))
+                        key = ts['key']
+                        val = int(ts['value'])
+                        if key == 'worker_start':
+                            worker_starts.append(val)
+                        elif key == 'worker_end':
+                            worker_ends.append(val)
+                        elif key == 'local_uf_start':
+                            algo_starts.append(val)
+                        elif key == 'global_merge_end':
+                            algo_ends.append(val)
+                        elif key == 'get_input':
+                            load_starts.append(val)
+                        elif key == 'get_input_end':
+                            load_ends.append(val)
 
     total_time_s = (finished - host_submit) / 1000.0
     if worker_starts and worker_ends:
@@ -277,7 +285,7 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
     if algo_starts and algo_ends:
         burst_time_s = (max(algo_ends) - min(algo_starts)) / 1000.0
     else:
-        burst_time_s  = warm_total_s
+        burst_time_s = warm_total_s
 
     if worker_starts:
         cold_start_s = max(0.0, (min(worker_starts) - host_submit) / 1000.0)
@@ -285,13 +293,19 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
     else:
         cold_start_s = 0.0
         stagger_s = 0.0
-    
+
+    # load_ms: parallel span of S3 download phase (get_input → get_input_end)
+    load_ms = None
+    if load_starts and load_ends:
+        load_ms = max(0, max(load_ends) - min(load_starts))
+
     timing_details = {
         "cold_start_ms":  round(cold_start_s  * 1000),
         "stagger_ms":     round(stagger_s     * 1000),
         "computation_ms": round(burst_time_s  * 1000),
+        "load_ms":        load_ms,
         "warm_total_ms":  round(warm_total_s  * 1000),
-        "total_ms": round(total_time_s * 1000),
+        "total_ms":       round(total_time_s  * 1000),
     }
     return num_components, burst_time_s, total_time_s, timing_details, component_hash
 
