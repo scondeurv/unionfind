@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""
-Benchmark WCC: Burst vs Standalone comparison.
-
-This script runs both burst (distributed) and standalone (local) WCC
-and compares the results for validation.
-"""
+"""Compare standalone WCC with the Burst implementation."""
 
 import argparse
 import json
@@ -58,6 +53,12 @@ def clean_burst_cluster() -> None:
         raise RuntimeError("failed to clean Burst cluster before running wcc")
 
 
+def pick_winner(speedup: float | None) -> str | None:
+    if speedup is None:
+        return None
+    return "Burst" if speedup > 1.0 else "Standalone"
+
+
 def canonical_component_hash(parent: List[int]) -> str:
     root_to_component: dict[int, int] = {}
     next_component = 0
@@ -71,10 +72,10 @@ def canonical_component_hash(parent: List[int]) -> str:
     return f"{hash_value:016x}"
 
 
-def download_graph_from_s3(bucket: str, key: str, endpoint: str, 
+def download_graph_from_s3(bucket: str, key: str, endpoint: str,
                            output_file: str, num_partitions: int = 4,
                            input_format: str = "binary") -> int:
-    """Download partitioned graph from S3 and merge into single file."""
+    """Download the partitioned graph from S3 into one local TSV file."""
     access_key = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
     secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
     
@@ -117,7 +118,7 @@ def download_graph_from_s3(bucket: str, key: str, endpoint: str,
 
 
 def s3_partitions_available(bucket: str, key: str, endpoint: str, num_partitions: int) -> bool:
-    """Return True when every expected UF partition exists and is non-empty."""
+    """Return True when every expected partition exists and is non-empty."""
     access_key = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
     secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
     s3 = boto3.client(
@@ -183,7 +184,7 @@ def ensure_input_data(args, num_nodes: int, key: str) -> str | None:
 
 
 def run_standalone(graph_file: str, num_nodes: int, standalone_binary: str) -> Dict:
-    """Run standalone WCC and return results."""
+    """Run standalone WCC and return the parsed result."""
     result = subprocess.run(
         [standalone_binary, graph_file, str(num_nodes)],
         capture_output=True,
@@ -260,7 +261,6 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
                         num_components = item['num_components']
                     if item.get('component_hash') is not None:
                         component_hash = item['component_hash']
-                    # Extract per-worker timestamps
                     for ts in item.get('timestamps', []):
                         key = ts['key']
                         val = int(ts['value'])
@@ -294,7 +294,6 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
         cold_start_s = 0.0
         stagger_s = 0.0
 
-    # load_ms: parallel span of S3 download phase (get_input → get_input_end)
     load_ms = None
     if load_starts and load_ends:
         load_ms = max(0, max(load_ends) - min(load_starts))
@@ -308,6 +307,17 @@ def run_burst(args, num_nodes: int, bucket: str, key: str) -> Tuple[int, float, 
         "total_ms":       round(total_time_s  * 1000),
     }
     return num_components, burst_time_s, total_time_s, timing_details, component_hash
+
+
+def build_validation_summary(result: Dict) -> Dict:
+    raw_validation = result.get("validation")
+    return {
+        "requested": "standalone" in result and "burst" in result,
+        "performed": raw_validation is not None,
+        "passed": raw_validation == "PASSED",
+        "skipped_reason": None if raw_validation is not None else "validation not available",
+        "mode": "exact_hash" if raw_validation is not None else None,
+    }
 
 
 def build_benchmark_summary(result: Dict) -> Dict:
@@ -347,9 +357,9 @@ def build_benchmark_summary(result: Dict) -> Dict:
     if standalone_total_ms not in (None, 0) and burst_host_total_ms not in (None, 0):
         cold_speedup = standalone_total_ms / burst_host_total_ms
 
-    winner_span = "Burst" if algo_speedup is not None and algo_speedup > 1.0 else "Standalone" if algo_speedup is not None else None
-    winner_warm = "Burst" if warm_speedup is not None and warm_speedup > 1.0 else "Standalone" if warm_speedup is not None else None
-    winner_total = "Burst" if cold_speedup is not None and cold_speedup > 1.0 else "Standalone" if cold_speedup is not None else None
+    winner_span = pick_winner(algo_speedup)
+    winner_warm = pick_winner(warm_speedup)
+    winner_total = pick_winner(cold_speedup)
     primary_metric = "total" if cold_speedup is not None else ("warm" if warm_speedup is not None else "span")
 
     return {
@@ -394,13 +404,7 @@ def build_benchmark_summary(result: Dict) -> Dict:
             "primary_metric": primary_metric,
             "primary": winner_total if winner_total is not None else winner_warm if winner_warm is not None else winner_span,
         },
-        "validation": {
-            "requested": "standalone" in result and "burst" in result,
-            "performed": "validation" in result,
-            "passed": result.get("validation") == "PASSED",
-            "skipped_reason": None if "validation" in result else "validation not available",
-            "mode": "exact_hash" if "validation" in result else None,
-        },
+        "validation": build_validation_summary(result),
     }
 
 
@@ -409,7 +413,6 @@ def main():
     add_openwhisk_to_parser(parser)
     add_burst_to_parser(parser)
     
-    # UF-specific arguments
     parser.add_argument("--wcc-endpoint", "--uf-endpoint", dest="wcc_endpoint", type=str, required=True,
                         help="Endpoint of the S3 service (for workers)")
     parser.add_argument("--local-endpoint", type=str, default="http://localhost:9000",
@@ -423,7 +426,6 @@ def main():
     parser.add_argument("--input-format", type=str, default="binary", choices=["binary", "tsv", "text"],
                         help="Input partition format in S3 (default: binary)")
     
-    # Benchmark specific
     parser.add_argument("--sizes", type=str, default="5000,10000,50000,100000",
                         help="Comma-separated list of node counts to benchmark")
     parser.add_argument("--wcc-binary", "--ufst-binary", dest="wcc_binary", type=str,
@@ -465,7 +467,6 @@ def main():
         }
         prepared_graph = ensure_input_data(args, num_nodes, key)
         
-        # Use local file or download from S3 for standalone
         if not args.skip_standalone:
             if prepared_graph and os.path.exists(prepared_graph):
                 temp_graph = prepared_graph
@@ -484,7 +485,6 @@ def main():
                 print(f"Downloaded {num_edges:,} unique edges")
                 result["edges"] = num_edges
             
-            # Run standalone
             print(f"\nRunning standalone {BENCHMARK_NAME}...")
             standalone_result = run_standalone(temp_graph, num_nodes, args.wcc_binary)
             
@@ -506,7 +506,6 @@ def main():
             if delete_after:
                 os.unlink(temp_graph)
         
-        # Run burst
         if not args.skip_burst:
             clean_burst_cluster()
             print(f"\nRunning burst {BENCHMARK_NAME} ({args.partitions} workers)...")
@@ -540,7 +539,6 @@ def main():
                 print(f"Burst Time (Total): FAILED")
                 print(f"Burst Processing Time (Distributed Span): FAILED")
         
-        # Compute speedups
         st_exec_ms = result.get("standalone", {}).get("execution_time_ms")
         st_total_ms = result.get("standalone", {}).get("total_time_ms")
         bt_ms = result.get("burst", {}).get("time_ms")
@@ -556,7 +554,6 @@ def main():
             total_speedup = st_total_ms / bt_total_ms
             print(f"Overall Speedup (Total): {total_speedup:.2f}x")
         
-        # Validate
         if "standalone" in result and "burst" in result:
             standalone_comp = result["standalone"]["num_components"]
             burst_comp = result["burst"].get("num_components")
@@ -578,7 +575,6 @@ def main():
         
         results.append(result)
     
-    # Summary
     print("\n" + "=" * 60)
     print("BENCHMARK SUMMARY")
     print("=" * 60)
@@ -601,7 +597,6 @@ def main():
         
         print(f"{nodes:>12,} | {comp:>10} | {st_time:>10.3f}s | {bt_time:>10.3f}s | {speedup_str:>8} | {valid}")
     
-    # Save results
     with open(args.output, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {args.output}")
