@@ -62,12 +62,12 @@ fn main() {
 
     let num_groups = args.burst_size / args.granularity;
     println!("num_groups: {}", num_groups);
-    
+
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
-    
+
     let group_ranges = (0..num_groups)
         .map(|group_id| {
             (
@@ -87,11 +87,11 @@ fn main() {
     .enable_message_chunking(args.enable_chunking)
     .message_chunk_size(args.message_chunk_size)
     .build();
-    
+
     let channel_options = TokioChannelOptions::new()
         .broadcast_channel_size(256)
         .build();
-    
+
     let backend_options = RedisListOptions::new(args.redis_url.clone()).build();
 
     let fut = BurstMiddleware::create_proxies::<TokioChannelImpl, RedisListImpl, _, _>(

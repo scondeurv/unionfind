@@ -5,18 +5,18 @@
 //!
 //! ## Algorithm Overview
 //!
-//! 1. **Phase 1: Local UF**: Each worker processes its assigned partitions locally 
+//! 1. **Phase 1: Local UF**: Each worker processes its assigned partitions locally
 //!    using path compression and union by rank.
-//! 2. **Phase 2: Global Merge**: Workers identify "boundary" roots (roots of elements 
-//!    that appeared in their partitions but might be connected in others). 
+//! 2. **Phase 2: Global Merge**: Workers identify "boundary" roots (roots of elements
+//!    that appeared in their partitions but might be connected in others).
 //!    They send root equivalences to the root worker.
-//! 3. **Phase 3: Final Consolidation**: The root worker merges everything and broadcasts 
+//! 3. **Phase 3: Final Consolidation**: The root worker merges everything and broadcasts
 //!    the final component mappings.
 //!
 //! This reduces communication from O(log N) sync rounds to exactly 2 rounds.
 
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_config::Region;
 use aws_credential_types::Credentials;
@@ -127,6 +127,8 @@ struct Input {
     num_nodes: u32,
     partitions: u32,
     granularity: u32,
+    #[serde(default)]
+    group_id: Option<u32>,
     timeout_seconds: Option<u64>,
 }
 
@@ -193,7 +195,9 @@ fn canonical_component_hash(parent: &[u32]) -> String {
 }
 
 fn looks_like_tsv(bytes: &[u8]) -> bool {
-    bytes.iter().any(|&b| b == b'\t' || b == b'\n' || b == b'\r')
+    bytes
+        .iter()
+        .any(|&b| b == b'\t' || b == b'\n' || b == b'\r')
 }
 
 fn parse_binary_edges_into_uf(
@@ -252,38 +256,50 @@ async fn download_partitions(
     params: &Input,
     s3_client: &S3Client,
     worker_id: u32,
-) -> Vec<Vec<u8>> {
-    let start_part = worker_id;
-    let end_part = worker_id + 1;
+) -> Result<Vec<Vec<u8>>, String> {
+    let logical_worker = logical_worker_id(worker_id, params.granularity, params.group_id);
+    let parts = partition_range(logical_worker, params.granularity);
 
     let mut fetch_futures = Vec::new();
-    for p in start_part..end_part {
+    for p in parts.clone() {
         let part_key = format!("{}/part-{:05}", params.input_data.key, p);
         fetch_futures.push(async move {
-            (p, s3_client
-                .get_object()
-                .bucket(&params.input_data.bucket)
-                .key(&part_key)
-                .send()
-                .await)
+            (
+                p,
+                part_key.clone(),
+                s3_client
+                    .get_object()
+                    .bucket(&params.input_data.bucket)
+                    .key(&part_key)
+                    .send()
+                    .await,
+            )
         });
     }
 
     let results = join_all(fetch_futures).await;
     let mut buffers: Vec<Vec<u8>> = Vec::new();
 
-    for (p, result) in results {
+    for (p, part_key, result) in results {
         match result {
-            Ok(output) => {
-                match output.body.collect().await {
-                    Ok(data) => buffers.push(data.to_vec()),
-                    Err(e) => eprintln!("[Worker {}] Error collecting body for partition {}: {}", worker_id, p, e),
+            Ok(output) => match output.body.collect().await {
+                Ok(data) => buffers.push(data.to_vec()),
+                Err(e) => {
+                    return Err(format!(
+                        "[Worker {}|logical {}] Error collecting partition {} ({}): {}",
+                        worker_id, logical_worker, p, part_key, e
+                    ));
                 }
+            },
+            Err(e) => {
+                return Err(format!(
+                    "[Worker {}|logical {}] Missing or unreadable partition {} ({}): {}",
+                    worker_id, logical_worker, p, part_key, e
+                ));
             }
-            Err(e) => eprintln!("[Worker {}] S3 error fetching partition {}: {}", worker_id, p, e),
         }
     }
-    buffers
+    Ok(buffers)
 }
 
 /// Process pre-downloaded byte buffers into Union-Find state.
@@ -312,6 +328,15 @@ fn process_buffers_into_uf(
     parsed_edges
 }
 
+fn logical_worker_id(worker_id: u32, granularity: u32, group_id: Option<u32>) -> u32 {
+    group_id.unwrap_or_else(|| worker_id / granularity.max(1))
+}
+
+fn partition_range(logical_worker: u32, granularity: u32) -> std::ops::Range<u32> {
+    let start = logical_worker * granularity;
+    start..(start + granularity)
+}
+
 /// Optimized 2-Phase Union-Find (sync - middleware calls must not be in tokio context)
 fn union_find_optimized(
     params: Input,
@@ -319,6 +344,7 @@ fn union_find_optimized(
 ) -> Output {
     let mut timestamps = vec![timestamp("worker_start")];
     let worker = middleware.info.worker_id;
+    let logical_worker = logical_worker_id(worker, params.granularity, params.group_id);
 
     // Create tokio runtime for async S3 operations only
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -349,7 +375,9 @@ fn union_find_optimized(
 
     // Phase 1a: Download S3 partitions into memory buffers (load phase).
     timestamps.push(timestamp("get_input"));
-    let buffers = rt.block_on(download_partitions(&params, &s3_client, worker));
+    let buffers = rt
+        .block_on(download_partitions(&params, &s3_client, worker))
+        .unwrap_or_else(|err| panic!("{err}"));
     timestamps.push(timestamp("get_input_end"));
 
     // Phase 1b: Run local Union-Find on the buffered data (compute phase).
@@ -372,7 +400,7 @@ fn union_find_optimized(
     let seen_count = seen.iter().filter(|&&v| v).count();
     println!(
         "[Worker {}] Local UF done: {} processed edges, {} seen nodes",
-        worker, processed_edges, seen_count
+        logical_worker, processed_edges, seen_count
     );
 
     // Phase 2: Collect (node, root) only for non-root seen nodes.
@@ -391,7 +419,8 @@ fn union_find_optimized(
 
     println!(
         "[Worker {}] Sending {} node-root pairs for global merge",
-        worker, node_root_pairs.len()
+        logical_worker,
+        node_root_pairs.len()
     );
 
     timestamps.push(timestamp("reduce_start"));
@@ -409,15 +438,15 @@ fn union_find_optimized(
     // For each (node, root) pair received, flat_union(node, root) connects them.
     // Nodes that appear in multiple workers with different roots get merged
     // transitively through the shared node. O(N·α(N)) ≈ O(N) total.
-    
+
     let root_summary = if worker == ROOT_WORKER {
         timestamps.push(timestamp("global_merge_start"));
-        
+
         let gn = params.num_nodes as usize;
         let mut gparent: HashMap<u32, u32> = HashMap::new();
         let mut grank: HashMap<u32, u8> = HashMap::new();
         let mut gseen: HashSet<u32> = HashSet::new();
-        
+
         if let Some(ref msg) = all_equivalences {
             for &(node, root) in &msg.0 {
                 if node < params.num_nodes && root < params.num_nodes {
@@ -427,7 +456,7 @@ fn union_find_optimized(
                 }
             }
         }
-        
+
         // Count components in a single pass
         let mut global_roots_set: HashSet<u32> = HashSet::new();
         for &node in &gseen {
@@ -435,7 +464,7 @@ fn union_find_optimized(
         }
         let num_unseen = gn.saturating_sub(gseen.len());
         let nc = global_roots_set.len() + num_unseen;
-        
+
         println!(
             "[Worker {}] Global merge: {} seen nodes, {} global roots, {} isolated → {} components",
             worker,
@@ -444,7 +473,7 @@ fn union_find_optimized(
             num_unseen,
             nc
         );
-        
+
         timestamps.push(timestamp("global_merge_end"));
         let mut full_parent = vec![0u32; gn];
         for (node, slot) in full_parent.iter_mut().enumerate() {
@@ -470,11 +499,16 @@ fn union_find_optimized(
         let hash_val = u64::from_str_radix(hash_str, 16).unwrap_or(0);
         let hash_high = (hash_val >> 32) as u32;
         let hash_low = hash_val as u32;
-        Some(ParentMessage(vec![(u32::MAX, nc as u32), (hash_high, hash_low)]))
+        Some(ParentMessage(vec![
+            (u32::MAX, nc as u32),
+            (hash_high, hash_low),
+        ]))
     } else {
         None
     };
-    let received = middleware.broadcast(broadcast_payload, ROOT_WORKER).unwrap();
+    let received = middleware
+        .broadcast(broadcast_payload, ROOT_WORKER)
+        .unwrap();
     timestamps.push(timestamp("broadcast_end"));
 
     let (num_components, component_hash, results_report) = {
@@ -513,4 +547,24 @@ pub fn main(args: Value, burst_middleware: Middleware<ParentMessage>) -> Result<
     let handle = burst_middleware.get_actor_handle();
     let result = union_find_optimized(input, &handle);
     serde_json::to_value(result).map_err(|e| e.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_partition_range_from_group() {
+        assert_eq!(logical_worker_id(3, 2, Some(1)), 1);
+        assert_eq!(partition_range(1, 2), 2..4);
+    }
+
+    #[test]
+    fn test_component_hash_is_stable() {
+        let parent = vec![0, 0, 2, 2, 4];
+        assert_eq!(
+            canonical_component_hash(&parent),
+            canonical_component_hash(&parent)
+        );
+    }
 }
