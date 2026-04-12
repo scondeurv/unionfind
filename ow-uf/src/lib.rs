@@ -343,16 +343,17 @@ fn union_find_optimized(
     middleware: &MiddlewareActorHandle<ParentMessage>,
 ) -> Output {
     let mut timestamps = vec![timestamp("worker_start")];
+    // Read worker-local context and the benchmark parameters we need for the run.
     let worker = middleware.info.worker_id;
     let logical_worker = logical_worker_id(worker, params.granularity, params.group_id);
 
-    // Create tokio runtime for async S3 operations only
+    // Build the small runtime used for the input S3 calls.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
 
-    // Initialize S3 client
+    // Build the S3 client for partition download.
     let credentials_provider = Credentials::from_keys(
         params.input_data.aws_access_key_id.clone(),
         params.input_data.aws_secret_access_key.clone(),
@@ -373,14 +374,14 @@ fn union_find_optimized(
     };
     let s3_client = S3Client::from_conf(config);
 
-    // Phase 1a: Download S3 partitions into memory buffers (load phase).
+    // Download the partitions owned by this logical worker.
     timestamps.push(timestamp("get_input"));
     let buffers = rt
         .block_on(download_partitions(&params, &s3_client, worker))
         .unwrap_or_else(|err| panic!("{err}"));
     timestamps.push(timestamp("get_input_end"));
 
-    // Phase 1b: Run local Union-Find on the buffered data (compute phase).
+    // Run the local Union-Find pass on the downloaded buffers.
     timestamps.push(timestamp("local_uf_start"));
     let n = params.num_nodes as usize;
     let mut parent: Vec<u32> = (0..n as u32).collect();
@@ -403,10 +404,7 @@ fn union_find_optimized(
         logical_worker, processed_edges, seen_count
     );
 
-    // Phase 2: Collect (node, root) only for non-root seen nodes.
-    // Self-pairs (root, root) are omitted — the global UF already initialises
-    // parent[i] = i, so they carry no new information. This reduces the
-    // volume of data transferred during the reduce step.
+    // Keep only the node-root pairs that carry information into the global merge.
     let mut node_root_pairs: Vec<(u32, u32)> = Vec::new();
     for i in 0..n {
         if seen[i] {
@@ -424,7 +422,7 @@ fn union_find_optimized(
     );
 
     timestamps.push(timestamp("reduce_start"));
-    // ROOT_WORKER collects all equivalences
+    // Send all local equivalences to the root worker.
     let all_equivalences = middleware
         .reduce(ParentMessage(node_root_pairs), |mut left, right| {
             left.0.extend(right.0);
@@ -433,11 +431,7 @@ fn union_find_optimized(
         .unwrap();
     timestamps.push(timestamp("reduce_end"));
 
-    // Phase 3: Global Merge with sparse UF (Root worker only)
-    //
-    // For each (node, root) pair received, flat_union(node, root) connects them.
-    // Nodes that appear in multiple workers with different roots get merged
-    // transitively through the shared node. O(N·α(N)) ≈ O(N) total.
+    // The root worker merges all local equivalences into the final global components.
 
     let root_summary = if worker == ROOT_WORKER {
         timestamps.push(timestamp("global_merge_start"));
@@ -457,7 +451,7 @@ fn union_find_optimized(
             }
         }
 
-        // Count components in a single pass
+        // Count the final components before broadcasting the summary.
         let mut global_roots_set: HashSet<u32> = HashSet::new();
         for &node in &gseen {
             global_roots_set.insert(sparse_find(&mut gparent, node));
@@ -490,9 +484,7 @@ fn union_find_optimized(
         None
     };
 
-    // Broadcast result from ROOT_WORKER to all workers.
-    // Encoded as ParentMessage: [(u32::MAX, num_components), (hash_high, hash_low)]
-    // u32::MAX is a sentinel that distinguishes this from reduce data (node ids < u32::MAX).
+    // Broadcast a compact summary so every worker returns the same final metadata.
     timestamps.push(timestamp("broadcast_start"));
     let broadcast_payload = if worker == ROOT_WORKER {
         let (nc, ref hash_str) = root_summary.clone().unwrap();
